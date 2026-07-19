@@ -5,6 +5,8 @@ A local meeting recorder for Windows. It captures whatever your PC is playing
 audio, transcripts, and AI summaries entirely on your machine. No cloud, no
 accounts.
 
+![Minutewright UI](docs/images/ui.png)
+
 **Status:** early development. Build progress is tracked in
 [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
 
@@ -22,23 +24,24 @@ crafts meeting minutes.
   model download.
 - Detects the CPU/GPU on first run and automatically picks the largest
   Whisper model that machine can handle in real time — no configuration
-  needed. If a GPU is present but its CUDA libraries can't actually run
-  inference, the app verifies this at startup and falls back to a CPU
-  model instead of crashing mid-meeting.
-- A local FastAPI server exposes recording control and transcripts over
-  HTTP — see [docs/API.md](docs/API.md).
+  needed. If a GPU is present but its CUDA libraries can't run inference,
+  the app verifies this at startup and falls back to a CPU model instead
+  of crashing mid-meeting.
+- A native desktop window (pywebview) over a local FastAPI engine — see
+  [docs/API.md](docs/API.md) for the endpoint contract.
 
 ## Run the app
 
     conda activate minutewright
     pip install -r requirements.txt
-    python main.py
+    python desktop.py
 
-Your browser opens the interactive API tester at http://127.0.0.1:8737/docs.
-Start a recording with `POST /api/record/start`, watch `GET /api/live`,
-stop with `POST /api/record/stop`. Transcripts land in `recordings/<id>/`.
+A native Minutewright window opens: press **Start recording** during any
+meeting or video, watch the live transcript, stop, then play back audio and
+read transcripts from the Library. Everything lands in `recordings/<id>/`.
 
-(A real browser UI replaces the API tester in an upcoming phase.)
+Developer mode (API tester instead of the window): `python main.py`, then
+visit http://127.0.0.1:8737/docs.
 
 ### Optional: GPU acceleration (NVIDIA)
 
@@ -49,16 +52,8 @@ install the CUDA runtime libraries for a large speed and accuracy boost:
 
 The app finds and loads these automatically at startup (including the
 Windows DLL-discovery workaround), verifies real GPU inference works, and
-falls back to CPU with a clear reason in `/api/status` if it doesn't.
+falls back to CPU with a clear reason if it doesn't.
 To check your GPU path in isolation: `python spikes/gpu_check.py`.
-
-## Console captions (no server)
-
-    python live_console.py
-
-Play a meeting or video and captions print roughly every 5 seconds.
-Known limitation: words at chunk boundaries can be cut off or garbled —
-fixed properly in a later phase with overlapping windows.
 
 ## How the model is chosen
 
@@ -70,6 +65,13 @@ fixed properly in a later phase with overlapping windows.
 | CPU, 8+ cores and 8 GB+ RAM      | small (int8)              |
 | CPU, 4+ cores                    | base (int8)               |
 | Anything weaker                  | tiny (int8)               |
+
+## Roadmap
+
+- AI meeting summaries (local, via Ollama)
+- Chat with a transcript — ask questions about any meeting
+- Package as a standalone `Minutewright.exe`
+- Mix in the user's own microphone (currently records system audio only)
 
 ## Running the tests
 
