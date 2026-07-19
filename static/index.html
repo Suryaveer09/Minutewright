@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--
+  Minutewright UI. Deliberately framework-free: one file, plain JS.
+  - Polls /api/status every 2.5s (model badge, record-button enablement)
+  - Polls /api/live every 1.2s while recording (caption feed)
+  - Library reads /api/recordings; detail plays /audio and shows /transcript
+  Runs inside the pywebview window (Edge WebView2), so modern JS is fine.
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minutewright</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#1f2731; --panel:#29323e; --panel-2:#232c37; --line:#38434f;
+    --ink:#ede7db; --ink-dim:#93a0b0;
+    --amber:#e5b04a; --amber-dim:#8a6c2f;
+    --tally:#d9564c; --tally-deep:#b03d34;
+    --display:"Bricolage Grotesque",system-ui,sans-serif;
+    --body:"Public Sans",system-ui,sans-serif;
+    --mono:"IBM Plex Mono","Consolas",monospace;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--body); font-size:15px; line-height:1.55;
+  }
+
+  header{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px 22px; border-bottom:1px solid var(--line);
+  }
+  .wordmark{
+    font-family:var(--display); font-weight:700; font-size:20px;
+    display:flex; align-items:center; gap:10px;
+  }
+  .dot{
+    width:10px; height:10px; border-radius:50%;
+    background:var(--amber); box-shadow:0 0 0 3px rgba(229,176,74,.15);
+  }
+  .dot.rec{background:var(--tally); box-shadow:0 0 0 3px rgba(217,86,76,.2)}
+  .badge{
+    font-family:var(--mono); font-size:12px; color:var(--ink-dim);
+    border:1px solid var(--line); border-radius:999px; padding:5px 12px;
+    max-width:55vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .badge b{color:var(--amber); font-weight:500}
+  .badge.loading{animation:pulse 1.6s ease-in-out infinite}
+  .badge.err{color:var(--tally); border-color:var(--tally-deep)}
+  @keyframes pulse{50%{opacity:.45}}
+
+  main{
+    display:grid; grid-template-columns:360px 1fr; gap:18px;
+    padding:18px 22px 34px; max-width:1200px; margin:0 auto;
+  }
+  @media (max-width:860px){ main{grid-template-columns:1fr} }
+  .card{
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:18px;
+  }
+  .card h2{
+    font-family:var(--display); font-weight:500; font-size:13px;
+    text-transform:uppercase; letter-spacing:.14em; color:var(--ink-dim);
+    margin:0 0 14px;
+  }
+
+  .deck{align-self:start; position:sticky; top:18px}
+  .rec-btn{
+    width:100%; padding:15px; border:none; border-radius:10px;
+    font-family:var(--display); font-weight:700; font-size:17px;
+    background:var(--tally); color:#fff; cursor:pointer;
+  }
+  .rec-btn:hover{background:var(--tally-deep)}
+  .rec-btn:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+  .rec-btn[disabled]{background:var(--panel-2); color:var(--ink-dim); cursor:not-allowed}
+  .rec-btn.on{background:var(--panel-2); color:var(--ink); border:1px solid var(--tally)}
+  .timer{
+    font-family:var(--mono); font-size:34px; text-align:center;
+    margin:14px 0 6px; letter-spacing:.04em;
+  }
+  .meter{display:flex; gap:3px; height:22px; align-items:flex-end; justify-content:center; margin-bottom:12px}
+  .meter span{width:4px; height:20%; background:var(--amber-dim); border-radius:2px}
+  .recording .meter span{animation:vu 1s ease-in-out infinite; background:var(--amber)}
+  .meter span:nth-child(2n){animation-delay:.15s}
+  .meter span:nth-child(3n){animation-delay:.3s}
+  .meter span:nth-child(5n){animation-delay:.45s}
+  @keyframes vu{0%,100%{height:15%}50%{height:95%}}
+  @media (prefers-reduced-motion:reduce){.meter span,.badge.loading{animation:none !important}}
+  .hint{color:var(--ink-dim); font-size:13px; text-align:center; margin:0 0 4px}
+
+  .feed{
+    margin-top:12px; border-top:1px solid var(--line); padding-top:12px;
+    max-height:46vh; overflow-y:auto; font-size:14px;
+  }
+  .feed .row{margin-bottom:10px}
+  .feed .ts{font-family:var(--mono); font-size:11px; color:var(--amber); display:block}
+  .feed .empty{color:var(--ink-dim); font-size:13px}
+
+  .lib-list{display:flex; flex-direction:column; gap:8px}
+  .lib-item{
+    display:flex; justify-content:space-between; align-items:center; gap:10px;
+    padding:12px 14px; border:1px solid var(--line); border-radius:8px;
+    background:var(--panel-2); cursor:pointer; width:100%; text-align:left;
+    color:var(--ink); font-family:var(--body); font-size:15px;
+  }
+  .lib-item:hover{border-color:var(--amber-dim)}
+  .lib-item:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+  .lib-item.active{border-color:var(--amber)}
+  .lib-item .meta{font-family:var(--mono); font-size:12px; color:var(--ink-dim); white-space:nowrap}
+  .empty-lib{color:var(--ink-dim); font-size:14px}
+
+  .detail{margin-top:18px; display:none}
+  .detail.open{display:block}
+  .detail h3{font-family:var(--display); font-weight:700; font-size:19px; margin:0 0 2px}
+  .detail .sub{font-family:var(--mono); font-size:12px; color:var(--ink-dim); margin-bottom:12px}
+  audio{width:100%; margin-bottom:6px}
+  .no-audio{display:none; color:var(--ink-dim); font-size:13px; margin-bottom:6px}
+  .pane{
+    white-space:pre-wrap; font-family:var(--mono); font-size:13px;
+    background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
+    padding:14px; max-height:48vh; overflow-y:auto; margin-top:8px;
+  }
+  .actions{display:flex; gap:10px; margin-top:12px}
+  .btn{
+    border:1px solid var(--line); background:var(--panel-2); color:var(--ink);
+    border-radius:8px; padding:8px 14px; font-family:var(--body); font-size:14px; cursor:pointer;
+  }
+  .btn:hover{border-color:var(--amber-dim)}
+  .btn:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+  .btn.danger{color:var(--tally); border-color:var(--tally-deep)}
+
+  .banner{
+    display:none; margin:14px 22px 0; padding:10px 14px; font-size:14px;
+    border:1px solid var(--tally-deep); border-radius:8px;
+    background:rgba(217,86,76,.12);
+  }
+  .banner.show{display:block}
+  footer{color:var(--ink-dim); font-size:12px; text-align:center; padding:0 22px 22px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark"><span class="dot" id="dot"></span>Minutewright</div>
+  <div class="badge loading" id="badge">starting engine…</div>
+</header>
+
+<div class="banner" id="banner" role="alert"></div>
+
+<main>
+  <section class="card deck" id="deck">
+    <h2>Deck</h2>
+    <button class="rec-btn" id="recBtn" disabled>Start recording</button>
+    <div class="timer" id="timer">00:00</div>
+    <div class="meter" aria-hidden="true">
+      <span></span><span></span><span></span><span></span><span></span><span></span>
+      <span></span><span></span><span></span><span></span><span></span><span></span>
+    </div>
+    <p class="hint">Captures what this PC plays — works with Teams, Zoom, anything.</p>
+    <div class="feed" id="feed"><div class="empty">Live transcript appears here while recording.</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Library</h2>
+    <div class="lib-list" id="libList"><div class="empty-lib">No recordings yet — start one and it will appear here.</div></div>
+
+    <div class="detail" id="detail">
+      <h3 id="dTitle"></h3>
+      <div class="sub" id="dSub"></div>
+      <audio controls preload="metadata" id="dAudio"></audio>
+      <div class="no-audio" id="noAudio">No audio saved for this recording (made before audio saving existed).</div>
+      <div class="pane" id="paneT"></div>
+      <div class="actions">
+        <button class="btn danger" id="delBtn">Delete recording</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>Runs entirely on this device. Audio and transcripts stay in the app's recordings folder.</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = async (path, opts) => {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { msg = (await res.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return res.json();
+};
+
+let recording = false;
+let livePoll = null, timerTick = null;
+let recStartMs = null;
+let openId = null;
+let delArmed = null;
+
+function banner(msg) {
+  const b = $('banner');
+  if (!msg) { b.classList.remove('show'); return; }
+  b.textContent = msg;
+  b.classList.add('show');
+}
+
+function esc(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmt(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = String(m).padStart(2,'0'), ss = String(s).padStart(2,'0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/* ---------- status / model badge ---------- */
+async function refreshStatus() {
+  try {
+    const st = await api('/api/status');
+    const badge = $('badge');
+    if (st.model_error) {
+      badge.className = 'badge err';
+      badge.textContent = 'speech model failed — see console';
+      $('recBtn').disabled = true;
+      return;
+    }
+    if (!st.model_ready) {
+      badge.className = 'badge loading';
+      badge.textContent = st.model
+        ? `loading ${st.model} · ${st.device} — first run downloads the model`
+        : 'detecting hardware…';
+      $('recBtn').disabled = true;
+    } else {
+      badge.className = 'badge';
+      badge.innerHTML = `<b>${esc(st.model)}</b> · ${esc(st.device)} · ${esc(st.reason || '')}`;
+      if (!recording) $('recBtn').disabled = false;
+    }
+    if (st.recording && !recording) enterRecording();  // engine was mid-recording
+  } catch (e) { /* server still starting */ }
+}
+
+/* ---------- recording ---------- */
+function enterRecording() {
+  recording = true;
+  recStartMs = recStartMs || Date.now();  // client-side timer; good enough for a display
+  $('recBtn').textContent = 'Stop recording';
+  $('recBtn').classList.add('on');
+  $('recBtn').disabled = false;
+  $('deck').classList.add('recording');
+  $('dot').classList.add('rec');
+  $('feed').innerHTML = '<div class="empty">Listening…</div>';
+  livePoll = setInterval(pollLive, 1200);
+  timerTick = setInterval(() => $('timer').textContent = fmt((Date.now() - recStartMs) / 1000), 500);
+}
+
+function exitRecording() {
+  recording = false;
+  recStartMs = null;
+  clearInterval(livePoll);
+  clearInterval(timerTick);
+  $('recBtn').textContent = 'Start recording';
+  $('recBtn').classList.remove('on');
+  $('deck').classList.remove('recording');
+  $('dot').classList.remove('rec');
+}
+
+async function pollLive() {
+  try {
+    const live = await api('/api/live');
+    if (!live.recording || !live.lines.length) return;
+    const feed = $('feed');
+    const stick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 30;
+    feed.innerHTML = live.lines.map(l =>
+      `<div class="row"><span class="ts">${fmt(l.t)}</span>${esc(l.text)}</div>`).join('');
+    if (stick) feed.scrollTop = feed.scrollHeight;
+  } catch (e) { /* keep polling */ }
+}
+
+$('recBtn').addEventListener('click', async () => {
+  $('recBtn').disabled = true;
+  banner('');
+  try {
+    if (!recording) {
+      await api('/api/record/start', { method: 'POST' });
+      $('timer').textContent = '00:00';
+      enterRecording();
+    } else {
+      $('recBtn').textContent = 'Finishing transcript…';
+      const meta = await api('/api/record/stop', { method: 'POST' });
+      exitRecording();
+      await loadLibrary();
+      openDetail(meta.id, meta);
+    }
+  } catch (e) {
+    banner(e.message);
+    if (!recording) { exitRecording(); }
+  }
+  $('recBtn').disabled = false;
+});
+
+/* ---------- library ---------- */
+async function loadLibrary() {
+  const items = await api('/api/recordings');
+  const list = $('libList');
+  if (!items.length) {
+    list.innerHTML = '<div class="empty-lib">No recordings yet — start one and it will appear here.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  items.forEach(it => {
+    const b = document.createElement('button');
+    b.className = 'lib-item' + (it.id === openId ? ' active' : '');
+    b.innerHTML = `<span>${esc(it.title || it.id)}</span>
+      <span class="meta">${fmt(it.duration_sec || 0)} · ${it.lines ?? 0} lines</span>`;
+    b.addEventListener('click', () => openDetail(it.id, it));
+    list.appendChild(b);
+  });
+}
+
+async function openDetail(id, item) {
+  openId = id;
+  resetDelete();
+  try {
+    if (!item) {
+      const items = await api('/api/recordings');
+      item = items.find(i => i.id === id) || { id };
+    }
+    $('detail').classList.add('open');
+    $('dTitle').textContent = item.title || id;
+    $('dSub').textContent =
+      `${id.replace('_', ' ')} · ${fmt(item.duration_sec || 0)} · ${item.model || ''}`;
+    $('noAudio').style.display = 'none';
+    $('dAudio').style.display = '';
+    $('dAudio').src = `/api/recordings/${id}/audio`;
+    const t = await api(`/api/recordings/${id}/transcript`);
+    $('paneT').textContent = t.text || 'Nothing transcribed — the audio may have been silent.';
+    await loadLibrary();
+  } catch (e) { banner(e.message); }
+}
+
+$('dAudio').addEventListener('error', () => {
+  // Old sessions recorded before WAV saving existed have no audio file.
+  if (!openId) return;
+  $('dAudio').style.display = 'none';
+  $('noAudio').style.display = 'block';
+});
+
+/* ---------- delete (two-click confirm; no native dialogs in webview) ---------- */
+function resetDelete() {
+  clearTimeout(delArmed);
+  delArmed = null;
+  $('delBtn').textContent = 'Delete recording';
+}
+$('delBtn').addEventListener('click', async () => {
+  if (!openId) return;
+  if (!delArmed) {
+    $('delBtn').textContent = 'Sure? Click again to delete';
+    delArmed = setTimeout(resetDelete, 3000);
+    return;
+  }
+  resetDelete();
+  try {
+    await api(`/api/recordings/${openId}`, { method: 'DELETE' });
+    $('detail').classList.remove('open');
+    openId = null;
+    await loadLibrary();
+  } catch (e) { banner(e.message); }
+});
+
+/* ---------- boot ---------- */
+refreshStatus();
+setInterval(refreshStatus, 2500);
+loadLibrary();
+</script>
+</body>
+</html>
