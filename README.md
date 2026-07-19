@@ -3,7 +3,8 @@
 A local meeting recorder for Windows. It captures whatever your PC is playing
 (Teams, Zoom, Meet...), shows a live transcript while you record, and stores
 audio, transcripts, and AI summaries entirely on your machine. No cloud, no
-accounts. You can even chat with a transcript to ask what you missed.
+accounts, no extra installs — the AI is built in. You can even chat with a
+transcript to ask what you missed.
 
 ![Minutewright UI](docs/images/ui.png)
 
@@ -27,12 +28,13 @@ crafts meeting minutes.
   needed. If a GPU is present but its CUDA libraries can't run inference,
   the app verifies this at startup and falls back to a CPU model instead
   of crashing mid-meeting.
-- One-click AI meeting minutes (Overview / Key points / Decisions /
-  Action items) via a local LLM through Ollama — optional, and everything
-  else works without it.
+- **AI summaries and chat are built in.** A local language model
+  (Llama 3.2 3B) runs *inside* the app — no Ollama, no accounts, no
+  terminal. The model downloads once (~2 GB) from a button in the app,
+  with a progress bar, then works fully offline.
 - **Chat with any recording**: ask "what were the action items?" and get
-  answers grounded only in that meeting's transcript — same local LLM,
-  honest "that wasn't discussed" when the answer isn't there.
+  answers grounded only in that meeting's transcript — with an honest
+  "that wasn't discussed" when the answer isn't there.
 - A native desktop window (pywebview) over a local FastAPI engine — see
   [docs/API.md](docs/API.md) for the endpoint contract.
 
@@ -45,27 +47,21 @@ crafts meeting minutes.
 A native Minutewright window opens: press **Start recording** during any
 meeting or video, watch the live transcript, stop, then play back audio,
 read transcripts, generate summaries, and chat — all from the Library.
-Everything lands in `recordings/<id>/`.
+Recordings land in `recordings/<id>/`; the AI model lives in `models/`.
 
 Developer mode (API tester instead of the window): `python main.py`, then
 visit http://127.0.0.1:8737/docs.
 
-### Summaries & chat (optional)
+The first time you open the Summary or Chat tab, the app offers a one-time
+**Download AI model (~2 GB)** button. Summaries and chat run on CPU so they
+work on every machine: expect a minute or two per summary (longer on
+modest hardware). GPU-accelerated generation is on the roadmap.
 
-Both run through [Ollama](https://ollama.com) so they stay local too:
+### Optional: GPU acceleration for transcription (NVIDIA)
 
-1. Install Ollama for Windows and let it run in the tray.
-2. Pull a small model once: `ollama pull llama3.2:3b`
-3. Open a recording and press **Generate summary**, or use the **Chat** tab.
-
-Set the `SUMMARY_MODEL` environment variable to force a specific Ollama
-model (e.g. `qwen2.5:7b` for better answers at the cost of speed). Without
-Ollama installed, both features show setup instructions instead of failing.
-
-### Optional: GPU acceleration (NVIDIA)
-
-The default install runs on CPU everywhere. If you have an NVIDIA card,
-install the CUDA runtime libraries for a large speed and accuracy boost:
+The default install transcribes on CPU everywhere. If you have an NVIDIA
+card, install the CUDA runtime libraries for a large speed and accuracy
+boost to live transcription:
 
     pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 
@@ -74,7 +70,7 @@ Windows DLL-discovery workaround), verifies real GPU inference works, and
 falls back to CPU with a clear reason if it doesn't.
 To check your GPU path in isolation: `python spikes/gpu_check.py`.
 
-## How the model is chosen
+## How the transcription model is chosen
 
 | Hardware found                  | Model chosen             |
 |----------------------------------|---------------------------|
@@ -88,12 +84,20 @@ To check your GPU path in isolation: `python spikes/gpu_check.py`.
 ## Roadmap
 
 - Package as a standalone `Minutewright.exe`
+- GPU-accelerated summaries and chat (optional, like transcription)
 - Mix in the user's own microphone (currently records system audio only)
+- Full-length summaries for very long meetings (chunked map-reduce)
 - Search across all meetings
 
 ## Running the tests
 
     pytest
+
+## Attribution
+
+AI summaries and chat are **Built with Llama** — Meta Llama 3.2, used
+under the Llama 3.2 Community License. Speech recognition uses OpenAI's
+open-source Whisper via faster-whisper.
 
 ## License
 
