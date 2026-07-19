@@ -3,13 +3,11 @@
 <head>
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
-  - Polls /api/status every 2.5s (Whisper badge, record-button enablement)
-  - Polls /api/llm/status (1s while downloading, 3s otherwise)
-  - Polls /api/upload/status (1s while a job runs, 3s otherwise); when a
-    job completes, the new session opens itself in the Library
-  - Polls /api/live every 1.2s while recording (caption feed)
-  Live recording and file uploads are mutually exclusive (one Whisper
-  instance); the buttons reflect that and the server enforces it.
+  - Transcript pane renders /api/recordings/{id}/lines: click any word
+    (word-timestamped sessions) or any line (older sessions) to seek the
+    audio player to that moment; the currently playing line highlights.
+  - Polls /api/status, /api/llm/status, /api/upload/status, /api/live as
+    before. Live recording and uploads stay mutually exclusive.
 -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -160,8 +158,21 @@
     white-space:pre-wrap; background:var(--panel-2); border:1px solid var(--line);
     border-radius:8px; padding:14px; max-height:46vh; overflow-y:auto; margin-top:10px;
   }
-  .pane.mono{font-family:var(--mono); font-size:13px}
   .pane.body{font-size:14px}
+
+  /* clickable transcript */
+  .tl{margin-bottom:12px; padding:4px 6px; border-radius:6px; border-left:2px solid transparent}
+  .tl.playing{background:rgba(229,176,74,.07); border-left-color:var(--amber)}
+  .tl-ts{
+    display:inline-block; background:none; border:none; cursor:pointer;
+    font-family:var(--mono); font-size:11px; color:var(--amber); padding:0;
+    margin-bottom:2px;
+  }
+  .tl-ts:hover{text-decoration:underline}
+  .tl-text{display:block; font-size:14px; line-height:1.7}
+  .w{cursor:pointer; border-radius:3px; padding:0 1px}
+  .w:hover{background:rgba(229,176,74,.22)}
+  .seek-hint{color:var(--ink-dim); font-size:12px; margin:0 0 8px}
 
   .chat{display:none; margin-top:10px}
   .chat.open{display:block}
@@ -254,7 +265,7 @@
         <button class="btn primary" id="llmBtn" style="display:none">Download AI model</button>
       </div>
 
-      <div class="pane mono" id="paneT"></div>
+      <div class="pane" id="paneT"></div>
       <div class="pane body" id="paneS" style="display:none"></div>
 
       <div class="chat" id="paneC">
@@ -301,6 +312,8 @@ let llmState = { state: 'missing' };
 let upState = { active: false };
 let upDoneSeen = null;
 let activeTab = 'T';
+let lineEls = [];      // transcript line elements + their start times, for playback highlight
+let playingIdx = -1;
 
 function banner(msg) {
   const b = $('banner');
@@ -321,9 +334,7 @@ function fmt(sec) {
 }
 
 function updateDeckButtons() {
-  $('recBtn').disabled = !whisperReady || upState.active || (!recording && false);
-  if (!whisperReady || upState.active) $('recBtn').disabled = !recording ? true : false;
-  else if (!recording) $('recBtn').disabled = false;
+  if (!recording) $('recBtn').disabled = !whisperReady || upState.active;
   $('upBtn').disabled = !whisperReady || recording || upState.active;
 }
 
@@ -548,8 +559,8 @@ async function openDetail(id, item) {
     $('dAudio').style.display = '';
     $('dAudio').src = `/api/recordings/${id}/audio`;
 
-    const t = await api(`/api/recordings/${id}/transcript`);
-    $('paneT').textContent = t.text || 'Nothing transcribed — the audio may have been silent.';
+    const data = await api(`/api/recordings/${id}/lines`);
+    renderTranscript(data.lines || []);
 
     const s = await api(`/api/recordings/${id}/summary`);
     setSummary(s.summary);
@@ -562,6 +573,61 @@ $('dAudio').addEventListener('error', () => {
   if (!openId) return;
   $('dAudio').style.display = 'none';
   $('noAudio').style.display = 'block';
+});
+
+/* ---------- clickable transcript + playback highlight ---------- */
+function renderTranscript(lines) {
+  const pane = $('paneT');
+  lineEls = [];
+  playingIdx = -1;
+  if (!lines.length) {
+    pane.innerHTML = '<span style="color:var(--ink-dim)">Nothing transcribed — the audio may have been silent.</span>';
+    return;
+  }
+  const hasWords = lines.some(l => (l.words || []).length);
+  let html = `<p class="seek-hint">${hasWords
+    ? 'Click any word to jump the audio to that moment.'
+    : 'Click a line to jump the audio to that moment.'}</p>`;
+  html += lines.map(l => {
+    const body = (l.words && l.words.length)
+      ? l.words.map(w => `<span class="w" data-s="${w.s}">${esc(w.w)}</span>`).join(' ')
+      : `<span class="w" data-s="${l.t}">${esc(l.text)}</span>`;
+    return `<div class="tl" data-t="${l.t}">
+      <button class="tl-ts" data-s="${l.t}">${fmt(l.t)}</button>
+      <span class="tl-text">${body}</span>
+    </div>`;
+  }).join('');
+  pane.innerHTML = html;
+  lineEls = Array.from(pane.querySelectorAll('.tl')).map(el => ({
+    el, t: parseFloat(el.dataset.t) || 0,
+  }));
+}
+
+$('paneT').addEventListener('click', e => {
+  const target = e.target.closest('[data-s]');
+  if (!target) return;
+  const audio = $('dAudio');
+  if (audio.style.display === 'none') {
+    banner('No audio is saved for this recording, so seeking isn\'t available.');
+    return;
+  }
+  const s = parseFloat(target.dataset.s);
+  if (isNaN(s)) return;
+  audio.currentTime = Math.max(0, s);
+  audio.play().catch(() => {});
+});
+
+$('dAudio').addEventListener('timeupdate', () => {
+  if (!lineEls.length) return;
+  const t = $('dAudio').currentTime;
+  let idx = -1;
+  for (let i = 0; i < lineEls.length; i++) {
+    if (lineEls[i].t <= t + 0.05) idx = i; else break;
+  }
+  if (idx === playingIdx) return;
+  if (playingIdx >= 0) lineEls[playingIdx].el.classList.remove('playing');
+  if (idx >= 0) lineEls[idx].el.classList.add('playing');
+  playingIdx = idx;
 });
 
 /* ---------- tabs ---------- */

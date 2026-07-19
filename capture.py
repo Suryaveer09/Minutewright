@@ -10,6 +10,10 @@ uses (whisper.cpp's stream demo, RealtimeSTT, etc).
 If a wav_path is given, the raw captured audio is also written to disk
 incrementally, so even an hours-long meeting never has to fit in memory.
 
+All transcription runs with word_timestamps=True so every word knows its
+position in the audio - that's what powers click-to-seek in the UI. Costs
+roughly 10-20% extra transcription time; worth it.
+
 Also home to transcribe_file(), used for user-uploaded recordings: one
 full-context pass over the whole file, which yields better transcripts
 than live chunking (no chunk-boundary garbling).
@@ -47,6 +51,16 @@ def to_mono_16k(raw: bytes, rate: int, channels: int) -> np.ndarray:
     return audio
 
 
+def _words_of(segment, offset: float = 0.0) -> list:
+    """Per-word timestamps from a segment -> [{"w": word, "s": seconds}]."""
+    out = []
+    for w in (segment.words or []):
+        word = w.word.strip()
+        if word:
+            out.append({"w": word, "s": round(offset + w.start, 2)})
+    return out
+
+
 class LiveCapture:
     """Records system audio and transcribes it in near-real-time chunks."""
 
@@ -54,7 +68,7 @@ class LiveCapture:
         self.model = model
         self.wav_path = wav_path      # if set, raw audio is saved here
         self.q: queue.Queue[bytes] = queue.Queue()
-        self.lines = []               # [{"t": seconds, "text": "..."}]
+        self.lines = []               # [{"t": s, "text": "...", "words": [...]}]
         self.rate = None
         self.channels = None
         self._stop = threading.Event()
@@ -161,15 +175,22 @@ class LiveCapture:
             segments, _ = self.model.transcribe(
                 piece, language="en", beam_size=1,
                 vad_filter=True, condition_on_previous_text=False,
+                word_timestamps=True,
             )
-            text = " ".join(s.text.strip() for s in segments).strip()
+            texts, words = [], []
+            for seg in segments:  # iterating IS the transcription
+                t = seg.text.strip()
+                if t:
+                    texts.append(t)
+                words.extend(_words_of(seg, offset=start_s))
+            text = " ".join(texts).strip()
         except Exception:
             # One bad chunk must not kill the whole meeting (learned the hard
             # way from the cuBLAS crash): log it and keep recording.
             print("Transcription error on one chunk:\n" + traceback.format_exc(limit=2))
             return
         if text:
-            line = {"t": start_s, "text": text}
+            line = {"t": start_s, "text": text, "words": words}
             self.lines.append(line)
             mm, ss = divmod(int(start_s), 60)
             print(f"[{mm:02d}:{ss:02d}] {text}")
@@ -187,15 +208,15 @@ def transcribe_file(model: WhisperModel, path, on_progress=None):
     segment's end time against the file's total duration.
 
     Returns (lines, duration_sec) where lines is the same shape LiveCapture
-    produces: [{"t": seconds, "text": "..."}].
+    produces: [{"t": seconds, "text": "...", "words": [{"w","s"}, ...]}].
     """
-    segments, info = model.transcribe(str(path), vad_filter=True)
+    segments, info = model.transcribe(str(path), vad_filter=True, word_timestamps=True)
     duration = float(info.duration or 0.0)
     lines = []
     for s in segments:  # generator: iterating IS the transcription
         text = s.text.strip()
         if text:
-            lines.append({"t": float(s.start), "text": text})
+            lines.append({"t": float(s.start), "text": text, "words": _words_of(s)})
         if on_progress and duration:
             on_progress(min(100.0, s.end / duration * 100.0))
     return lines, duration

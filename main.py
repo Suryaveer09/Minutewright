@@ -35,6 +35,7 @@ BASE = Path(__file__).resolve().parent
 REC_DIR = BASE / "recordings"
 REC_DIR.mkdir(exist_ok=True)
 ID_RE = re.compile(r"^[0-9_\-]+$")
+TS_LINE_RE = re.compile(r"^\[(\d+):(\d{2})\]\s?(.*)$")
 
 # Formats faster-whisper can decode out of the box (bundled FFmpeg via PyAV).
 AUDIO_TYPES = {
@@ -150,11 +151,18 @@ def rec_folder(rec_id: str) -> Path:
 
 def write_session_files(folder: Path, rec_id: str, title: str, lines: list,
                         duration: float, source: str):
-    """Write transcript.txt + meta.json in the shape every feature expects."""
+    """Write transcript.txt + lines.json + meta.json.
+
+    transcript.txt stays the plain, human/LLM-friendly format; lines.json
+    carries the structured version with word timestamps for click-to-seek.
+    """
     transcript = "\n".join(
         f"[{int(l['t']//60):02d}:{int(l['t']%60):02d}] {l['text']}" for l in lines
     )
     (folder / "transcript.txt").write_text(transcript, encoding="utf-8")
+    (folder / "lines.json").write_text(
+        json.dumps(lines, ensure_ascii=False), encoding="utf-8"
+    )
     meta = {
         "id": rec_id,
         "title": title,
@@ -347,6 +355,31 @@ def transcript(rec_id: str):
     if not f.exists():
         raise HTTPException(404, "Recording not found")
     return {"text": f.read_text(encoding="utf-8")}
+
+
+@app.get("/api/recordings/{rec_id}/lines")
+def transcript_lines(rec_id: str):
+    """Structured transcript for the UI: line + word timestamps.
+
+    Sessions from before word timestamps existed fall back to parsing
+    transcript.txt into line-level entries, so old recordings stay
+    clickable (line-accurate instead of word-accurate).
+    """
+    folder = rec_folder(rec_id)
+    jf = folder / "lines.json"
+    if jf.exists():
+        return {"lines": json.loads(jf.read_text(encoding="utf-8"))}
+    tf = folder / "transcript.txt"
+    lines = []
+    if tf.exists():
+        for raw in tf.read_text(encoding="utf-8").splitlines():
+            m = TS_LINE_RE.match(raw)
+            if m:
+                t = int(m.group(1)) * 60 + int(m.group(2))
+                lines.append({"t": t, "text": m.group(3), "words": []})
+            elif raw.strip():
+                lines.append({"t": 0, "text": raw.strip(), "words": []})
+    return {"lines": lines}
 
 
 @app.get("/api/recordings/{rec_id}/summary")
