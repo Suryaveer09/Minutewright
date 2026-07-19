@@ -27,6 +27,9 @@ crafts meeting minutes.
   needed. If a GPU is present but its CUDA libraries can't run inference,
   the app verifies this at startup and falls back to a CPU model instead
   of crashing mid-meeting.
+- One-click AI meeting minutes (Overview / Key points / Decisions /
+  Action items) via a local LLM through Ollama — optional, and everything
+  else works without it.
 - A native desktop window (pywebview) over a local FastAPI engine — see
   [docs/API.md](docs/API.md) for the endpoint contract.
 
@@ -37,11 +40,24 @@ crafts meeting minutes.
     python desktop.py
 
 A native Minutewright window opens: press **Start recording** during any
-meeting or video, watch the live transcript, stop, then play back audio and
-read transcripts from the Library. Everything lands in `recordings/<id>/`.
+meeting or video, watch the live transcript, stop, then play back audio,
+read transcripts, and generate summaries from the Library. Everything
+lands in `recordings/<id>/`.
 
 Developer mode (API tester instead of the window): `python main.py`, then
 visit http://127.0.0.1:8737/docs.
+
+### Summaries (optional)
+
+Summaries run through [Ollama](https://ollama.com) so they stay local too:
+
+1. Install Ollama for Windows and let it run in the tray.
+2. Pull a small model once: `ollama pull llama3.2:3b`
+3. Open a recording and press **Generate summary**.
+
+Set the `SUMMARY_MODEL` environment variable to force a specific Ollama
+model (e.g. `qwen2.5:7b` for better minutes at the cost of speed). Without
+Ollama installed, the button shows setup instructions instead of failing.
 
 ### Optional: GPU acceleration (NVIDIA)
 
@@ -68,7 +84,6 @@ To check your GPU path in isolation: `python spikes/gpu_check.py`.
 
 ## Roadmap
 
-- AI meeting summaries (local, via Ollama)
 - Chat with a transcript — ask questions about any meeting
 - Package as a standalone `Minutewright.exe`
 - Mix in the user's own microphone (currently records system audio only)
