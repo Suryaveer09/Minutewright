@@ -5,7 +5,8 @@ anything else) can start/stop recordings, upload existing recordings,
 poll live captions, generate summaries, and chat with transcripts.
 The Whisper model loads in a background thread at startup; the LLM for
 summaries/chat is bundled in-process (llm.py) and its weights are
-downloaded in-app on first use.
+downloaded in-app on first use. Audio-device choices (which speakers to
+loop back, which mic, mic on/off) persist in settings.json.
 """
 
 import json
@@ -26,7 +27,7 @@ from pydantic import BaseModel
 import chat as chatmod
 import llm
 import summarize as summarizer
-from capture import LiveCapture, transcribe_file
+from capture import LiveCapture, list_devices, transcribe_file
 from hardware import choose_model, cpu_choice, detect_hardware, enable_cuda_dlls
 
 enable_cuda_dlls()
@@ -48,6 +49,32 @@ AUDIO_TYPES = {
     ".flac": "audio/flac",
     ".webm": "audio/webm",
 }
+
+# ------------------------------------------------------------- settings
+SETTINGS_FILE = BASE / "settings.json"
+DEFAULT_SETTINGS = {"capture_mic": True, "mic_index": None, "loopback_index": None}
+_settings_lock = threading.Lock()
+
+
+def load_settings() -> dict:
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    s = dict(DEFAULT_SETTINGS)
+    s.update({k: data[k] for k in DEFAULT_SETTINGS if k in data})
+    return s
+
+
+def save_settings(s: dict):
+    with _settings_lock:
+        SETTINGS_FILE.write_text(json.dumps(s, indent=2), encoding="utf-8")
+
+
+class SettingsBody(BaseModel):
+    capture_mic: bool = True
+    mic_index: int | None = None
+    loopback_index: int | None = None
 
 
 class AppState:
@@ -200,6 +227,30 @@ def status():
     }
 
 
+@app.get("/api/devices")
+def devices():
+    try:
+        return list_devices()
+    except Exception as exc:
+        raise HTTPException(500, f"Couldn't list audio devices: {exc}")
+
+
+@app.get("/api/settings")
+def get_settings():
+    return load_settings()
+
+
+@app.post("/api/settings")
+def set_settings(body: SettingsBody):
+    if STATE.capture is not None:
+        raise HTTPException(409, "Stop the recording before changing audio settings.")
+    s = {"capture_mic": body.capture_mic,
+         "mic_index": body.mic_index,
+         "loopback_index": body.loopback_index}
+    save_settings(s)
+    return s
+
+
 @app.get("/api/llm/status")
 def llm_status():
     return llm.get_status()
@@ -221,16 +272,28 @@ def record_start():
     if STATE.model is None:
         raise HTTPException(503, "Speech model isn't loaded yet - check /api/status")
 
+    s = load_settings()
     rec_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     folder = REC_DIR / rec_id
     folder.mkdir(parents=True, exist_ok=True)
 
-    cap = LiveCapture(STATE.model, wav_path=folder / "audio.wav")
-    cap.start()
+    cap = LiveCapture(
+        STATE.model,
+        wav_path=folder / "audio.wav",
+        loopback_index=s["loopback_index"],
+        mic_index=s["mic_index"],
+        capture_mic=s["capture_mic"],
+    )
+    try:
+        info = cap.start()
+    except Exception as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(500, f"Could not start recording: {exc}")
+
     STATE.capture = cap
     STATE.session_id = rec_id
     STATE.session_folder = folder
-    return {"id": rec_id}
+    return {"id": rec_id, **info}
 
 
 @app.post("/api/record/stop")

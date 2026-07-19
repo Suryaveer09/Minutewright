@@ -3,11 +3,12 @@
 <head>
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
+  - Audio settings (mic on/off, speaker + mic device pickers) load from
+    /api/settings + /api/devices and save on change; locked mid-recording.
   - Transcript pane renders /api/recordings/{id}/lines: click any word
     (word-timestamped sessions) or any line (older sessions) to seek the
-    audio player to that moment; the currently playing line highlights.
-  - Polls /api/status, /api/llm/status, /api/upload/status, /api/live as
-    before. Live recording and uploads stay mutually exclusive.
+    audio player; the currently playing line highlights.
+  - Polls /api/status, /api/llm/status, /api/upload/status, /api/live.
 -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -88,6 +89,24 @@
   .upload-btn[disabled]{opacity:.5; cursor:not-allowed}
   .up-status{display:none; margin-top:10px; font-size:13px; color:var(--ink-dim)}
   .up-status.show{display:block}
+
+  .settings{
+    margin-top:12px; border-top:1px solid var(--line); padding-top:12px;
+    font-size:13px;
+  }
+  .settings label.chk{display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px}
+  .settings input[type=checkbox]{accent-color:var(--amber); width:15px; height:15px}
+  .settings .row{margin-bottom:8px}
+  .settings .row span{display:block; color:var(--ink-dim); font-size:12px; margin-bottom:3px}
+  .settings select{
+    width:100%; background:var(--panel-2); border:1px solid var(--line);
+    color:var(--ink); border-radius:8px; padding:7px 8px;
+    font-family:var(--body); font-size:13px;
+  }
+  .settings select:focus-visible{outline:2px solid var(--amber); outline-offset:1px}
+  .settings select[disabled], .settings input[disabled]{opacity:.5}
+  .mic-note{color:var(--ink-dim); font-size:12px; margin:2px 0 0}
+
   .timer{
     font-family:var(--mono); font-size:34px; text-align:center;
     margin:14px 0 6px; letter-spacing:.04em;
@@ -111,7 +130,7 @@
 
   .feed{
     margin-top:12px; border-top:1px solid var(--line); padding-top:12px;
-    max-height:40vh; overflow-y:auto; font-size:14px;
+    max-height:32vh; overflow-y:auto; font-size:14px;
   }
   .feed .row{margin-bottom:10px}
   .feed .ts{font-family:var(--mono); font-size:11px; color:var(--amber); display:block}
@@ -160,7 +179,6 @@
   }
   .pane.body{font-size:14px}
 
-  /* clickable transcript */
   .tl{margin-bottom:12px; padding:4px 6px; border-radius:6px; border-left:2px solid transparent}
   .tl.playing{background:rgba(229,176,74,.07); border-left-color:var(--amber)}
   .tl-ts{
@@ -233,12 +251,28 @@
       <div class="progress"><div class="fill" id="upFill"></div></div>
       <div class="progress-label" id="upLabel"></div>
     </div>
+
+    <div class="settings">
+      <label class="chk"><input type="checkbox" id="micChk" checked>
+        Also record my microphone</label>
+      <div class="row">
+        <span>System audio from</span>
+        <select id="spkSel"><option value="">System default speakers</option></select>
+      </div>
+      <div class="row" id="micRow">
+        <span>Microphone</span>
+        <select id="micSel"><option value="">System default microphone</option></select>
+      </div>
+      <p class="mic-note">Tip: use headphones — with open speakers your mic
+        re-hears the meeting and voices get doubled.</p>
+    </div>
+
     <div class="timer" id="timer">00:00</div>
     <div class="meter" aria-hidden="true">
       <span></span><span></span><span></span><span></span><span></span><span></span>
       <span></span><span></span><span></span><span></span><span></span><span></span>
     </div>
-    <p class="hint">Record what this PC plays, or upload a meeting file (Teams .mp4, phone .m4a, .mp3…).</p>
+    <p class="hint" id="deckHint">Records the meeting and your voice — works with Teams, Zoom, anything.</p>
     <div class="feed" id="feed"><div class="empty">Live transcript appears here while recording.</div></div>
   </section>
 
@@ -312,8 +346,9 @@ let llmState = { state: 'missing' };
 let upState = { active: false };
 let upDoneSeen = null;
 let activeTab = 'T';
-let lineEls = [];      // transcript line elements + their start times, for playback highlight
+let lineEls = [];
 let playingIdx = -1;
+let settings = { capture_mic: true, mic_index: null, loopback_index: null };
 
 function banner(msg) {
   const b = $('banner');
@@ -336,7 +371,55 @@ function fmt(sec) {
 function updateDeckButtons() {
   if (!recording) $('recBtn').disabled = !whisperReady || upState.active;
   $('upBtn').disabled = !whisperReady || recording || upState.active;
+  const lock = recording || upState.active;
+  $('micChk').disabled = lock;
+  $('spkSel').disabled = lock;
+  $('micSel').disabled = lock || !settings.capture_mic;
 }
+
+/* ---------- audio settings ---------- */
+async function loadAudioSettings() {
+  try {
+    const [dev, s] = await Promise.all([api('/api/devices'), api('/api/settings')]);
+    settings = s;
+    const fill = (sel, list, defLabel, chosen) => {
+      sel.innerHTML = `<option value="">${defLabel}</option>` +
+        list.map(d => `<option value="${d.index}">${esc(d.name)}</option>`).join('');
+      sel.value = (chosen === null || chosen === undefined) ? '' : String(chosen);
+      if (sel.value !== String(chosen ?? '')) sel.value = '';  // stale saved index
+    };
+    fill($('spkSel'), dev.speakers, 'System default speakers', s.loopback_index);
+    fill($('micSel'), dev.mics, 'System default microphone', s.mic_index);
+    $('micChk').checked = !!s.capture_mic;
+    syncHint();
+    updateDeckButtons();
+  } catch (e) { /* server starting; harmless, defaults apply */ }
+}
+
+async function saveAudioSettings() {
+  settings = {
+    capture_mic: $('micChk').checked,
+    loopback_index: $('spkSel').value === '' ? null : parseInt($('spkSel').value),
+    mic_index: $('micSel').value === '' ? null : parseInt($('micSel').value),
+  };
+  syncHint();
+  updateDeckButtons();
+  try { await api('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  }); } catch (e) { banner(e.message); }
+}
+
+function syncHint() {
+  $('deckHint').textContent = settings.capture_mic
+    ? 'Records the meeting and your voice — works with Teams, Zoom, anything.'
+    : 'Records system audio only — your own voice will not be captured.';
+}
+
+$('micChk').addEventListener('change', saveAudioSettings);
+$('spkSel').addEventListener('change', saveAudioSettings);
+$('micSel').addEventListener('change', saveAudioSettings);
 
 /* ---------- status / model badge ---------- */
 async function refreshStatus() {
@@ -362,7 +445,7 @@ async function refreshStatus() {
       whisperReady = true;
     }
     updateDeckButtons();
-    if (st.recording && !recording) enterRecording();  // engine was mid-recording
+    if (st.recording && !recording) enterRecording();
   } catch (e) { /* server still starting */ }
 }
 
@@ -505,7 +588,10 @@ $('recBtn').addEventListener('click', async () => {
   banner('');
   try {
     if (!recording) {
-      await api('/api/record/start', { method: 'POST' });
+      const res = await api('/api/record/start', { method: 'POST' });
+      if (res.mic_requested && !res.mic_active) {
+        banner(res.mic_error || 'Microphone unavailable — recording system audio only.');
+      }
       $('timer').textContent = '00:00';
       enterRecording();
     } else {
@@ -753,6 +839,7 @@ refreshStatus();
 setInterval(refreshStatus, 2500);
 pollLlm();
 pollUpload();
+loadAudioSettings();
 loadLibrary();
 </script>
 </body>

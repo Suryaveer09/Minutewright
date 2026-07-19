@@ -25,3 +25,4 @@ Thumbs.db
 .vscode/
 Misc/
 .pytest_cache/
+settings.json

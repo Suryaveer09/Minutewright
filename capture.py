@@ -1,18 +1,23 @@
-"""Capture system audio and transcribe it live.
+"""Capture system audio (and optionally the microphone) and transcribe live.
 
-Pipeline: WASAPI loopback callback -> queue -> worker thread -> resample to
-16kHz mono -> chunked faster-whisper transcription every few seconds.
+Pipeline: WASAPI loopback callback + optional mic callback -> queues ->
+worker thread -> both converted to 16kHz mono -> MIXED (sum + clip) ->
+written to a 16kHz mono WAV + chunked faster-whisper transcription.
 
-Whisper isn't a streaming model, so "live" captions are faked by transcribing
-short chunks as they fill up. This is the same trick every live-Whisper app
-uses (whisper.cpp's stream demo, RealtimeSTT, etc).
+Whisper isn't a streaming model, so "live" captions are faked by
+transcribing short chunks as they fill up.
 
-If a wav_path is given, the raw captured audio is also written to disk
-incrementally, so even an hours-long meeting never has to fit in memory.
+Notes on the mix:
+- The saved WAV is the mixed 16kHz mono track, so playback contains both
+  sides of a meeting. (Roadmap: dual-track native-quality recording.)
+- The two streams run on independent clocks; we mix min-available-length
+  each cycle, which keeps them aligned to well under a second over a
+  typical meeting. Good enough for transcription and review.
+- Open speakers cause the mic to re-hear remote voices (echoey doubling);
+  headphones give clean separation. The UI says so.
 
 All transcription runs with word_timestamps=True so every word knows its
-position in the audio - that's what powers click-to-seek in the UI. Costs
-roughly 10-20% extra transcription time; worth it.
+position in the audio - that's what powers click-to-seek in the UI.
 
 Also home to transcribe_file(), used for user-uploaded recordings: one
 full-context pass over the whole file, which yields better transcripts
@@ -39,7 +44,7 @@ def to_mono_16k(raw: bytes, rate: int, channels: int) -> np.ndarray:
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
     if channels > 1:
-        # Trim any leftover partial frame, then average L+R into one channel.
+        # Trim any leftover partial frame, then average channels to mono.
         usable = (len(audio) // channels) * channels
         audio = audio[:usable].reshape(-1, channels).mean(axis=1)
 
@@ -61,84 +66,200 @@ def _words_of(segment, offset: float = 0.0) -> list:
     return out
 
 
-class LiveCapture:
-    """Records system audio and transcribes it in near-real-time chunks."""
+def list_devices() -> dict:
+    """Enumerate WASAPI capture sources for the settings UI.
 
-    def __init__(self, model: WhisperModel, wav_path=None):
-        self.model = model
-        self.wav_path = wav_path      # if set, raw audio is saved here
-        self.q: queue.Queue[bytes] = queue.Queue()
-        self.lines = []               # [{"t": s, "text": "...", "words": [...]}]
-        self.rate = None
-        self.channels = None
-        self._stop = threading.Event()
-
-    def start(self):
-        p = pyaudio.PyAudio()
+    speakers: loopback devices (system-audio sources), shown without the
+    "[Loopback]" suffix; mics: real input devices. Restricted to the
+    WASAPI host API so each physical device appears once (not duplicated
+    by MME/DirectSound).
+    """
+    p = pyaudio.PyAudio()
+    try:
         wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-        speakers = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
-        if not speakers.get("isLoopbackDevice"):
-            for lb in p.get_loopback_device_info_generator():
-                if speakers["name"] in lb["name"]:
-                    speakers = lb
-                    break
+        speakers, mics = [], []
+        for lb in p.get_loopback_device_info_generator():
+            speakers.append({
+                "index": lb["index"],
+                "name": lb["name"].replace(" [Loopback]", ""),
+            })
+        for i in range(p.get_device_count()):
+            d = p.get_device_info_by_index(i)
+            if (d.get("hostApi") == wasapi["index"]
+                    and d.get("maxInputChannels", 0) > 0
+                    and not d.get("isLoopbackDevice")):
+                mics.append({"index": d["index"], "name": d["name"]})
+        return {"speakers": speakers, "mics": mics}
+    finally:
+        p.terminate()
 
-        self.rate = int(speakers["defaultSampleRate"])
-        self.channels = speakers["maxInputChannels"]
 
-        def callback(in_data, frame_count, time_info, status):
-            self.q.put(in_data)
+class LiveCapture:
+    """Records system audio (+ optional mic) and transcribes it live."""
+
+    def __init__(self, model: WhisperModel, wav_path=None,
+                 loopback_index=None, mic_index=None, capture_mic=True):
+        self.model = model
+        self.wav_path = wav_path
+        self.loopback_index = loopback_index   # None = default speakers
+        self.mic_index = mic_index             # None = default microphone
+        self.capture_mic = capture_mic
+        self.mic_active = False
+        self.mic_error = None
+
+        self.q_spk: queue.Queue[bytes] = queue.Queue()
+        self.q_mic: queue.Queue[bytes] = queue.Queue()
+        self.lines = []               # [{"t": s, "text": "...", "words": [...]}]
+        self._stop = threading.Event()
+        self._streams = []
+
+    # ------------------------------------------------------------- start
+    def start(self) -> dict:
+        p = pyaudio.PyAudio()
+        self._pa = p
+
+        # --- system audio (loopback) -------------------------------------
+        if self.loopback_index is not None:
+            try:
+                speakers = p.get_device_info_by_index(self.loopback_index)
+            except Exception:
+                speakers = None
+        else:
+            speakers = None
+        if speakers is None or not speakers.get("isLoopbackDevice"):
+            wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            speakers = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+            if not speakers.get("isLoopbackDevice"):
+                for lb in p.get_loopback_device_info_generator():
+                    if speakers["name"] in lb["name"]:
+                        speakers = lb
+                        break
+
+        self.spk_rate = int(speakers["defaultSampleRate"])
+        self.spk_channels = max(1, speakers["maxInputChannels"])
+
+        def spk_cb(in_data, frame_count, time_info, status):
+            self.q_spk.put(in_data)
             return (None, pyaudio.paContinue)
 
-        self._pa = p
-        self._stream = p.open(
+        self._streams.append(p.open(
             format=pyaudio.paInt16,
-            channels=self.channels,
-            rate=self.rate,
+            channels=self.spk_channels,
+            rate=self.spk_rate,
             frames_per_buffer=1024,
             input=True,
             input_device_index=speakers["index"],
-            stream_callback=callback,
-        )
-        self._stream.start_stream()
+            stream_callback=spk_cb,
+        ))
+        print(f"Listening to: {speakers['name']}")
+
+        # --- microphone (optional; failure never blocks recording) -------
+        if self.capture_mic:
+            try:
+                if self.mic_index is not None:
+                    mic = p.get_device_info_by_index(self.mic_index)
+                else:
+                    mic = p.get_default_input_device_info()
+                if mic.get("maxInputChannels", 0) < 1 or mic.get("isLoopbackDevice"):
+                    raise RuntimeError("Selected device can't record audio")
+
+                self.mic_rate = int(mic["defaultSampleRate"])
+                self.mic_channels = min(2, max(1, mic["maxInputChannels"]))
+
+                def mic_cb(in_data, frame_count, time_info, status):
+                    self.q_mic.put(in_data)
+                    return (None, pyaudio.paContinue)
+
+                self._streams.append(p.open(
+                    format=pyaudio.paInt16,
+                    channels=self.mic_channels,
+                    rate=self.mic_rate,
+                    frames_per_buffer=1024,
+                    input=True,
+                    input_device_index=mic["index"],
+                    stream_callback=mic_cb,
+                ))
+                self.mic_active = True
+                print(f"Also recording mic: {mic['name']}")
+            except Exception as exc:
+                self.mic_error = ("Couldn't open the microphone - recording "
+                                  "system audio only. " + str(exc))
+                print(self.mic_error)
+
+        for s in self._streams:
+            s.start_stream()
 
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
-        print(f"Listening to: {speakers['name']}")
+        return {"mic_requested": self.capture_mic,
+                "mic_active": self.mic_active,
+                "mic_error": self.mic_error}
 
     def stop(self):
         self._stop.set()
         self._worker_thread.join(timeout=30)
-        self._stream.stop_stream()
-        self._stream.close()
+        for s in self._streams:
+            try:
+                s.stop_stream()
+                s.close()
+            except Exception:
+                pass
         self._pa.terminate()
+
+    # ------------------------------------------------------------ worker
+    @staticmethod
+    def _drain(q: queue.Queue) -> bytes:
+        out = []
+        try:
+            while True:
+                out.append(q.get_nowait())
+        except queue.Empty:
+            pass
+        return b"".join(out)
 
     def _worker(self):
         wav = None
         if self.wav_path:
             wav = wave.open(str(self.wav_path), "wb")
-            wav.setnchannels(self.channels)
-            wav.setsampwidth(2)   # int16
-            wav.setframerate(self.rate)
+            wav.setnchannels(1)          # the mixed track is 16kHz mono
+            wav.setsampwidth(2)
+            wav.setframerate(TARGET_SR)
 
-        buf = np.zeros(0, dtype=np.float32)
+        spk16 = np.zeros(0, dtype=np.float32)   # converted, waiting to be mixed
+        mic16 = np.zeros(0, dtype=np.float32)
+        buf = np.zeros(0, dtype=np.float32)     # mixed, waiting to be transcribed
         chunk_n = int(CHUNK_SECONDS * TARGET_SR)
-        consumed = 0  # 16kHz samples already transcribed, for timestamps
+        consumed = 0
+
+        def emit(mixed: np.ndarray):
+            nonlocal buf
+            if not len(mixed):
+                return
+            if wav:
+                wav.writeframes((mixed * 32767).astype(np.int16).tobytes())
+            buf = np.concatenate([buf, mixed])
 
         try:
             while not self._stop.is_set():
-                drained = []
-                try:
-                    while True:
-                        drained.append(self.q.get_nowait())
-                except queue.Empty:
-                    pass
+                raw = self._drain(self.q_spk)
+                if raw:
+                    spk16 = np.concatenate(
+                        [spk16, to_mono_16k(raw, self.spk_rate, self.spk_channels)])
 
-                if drained:
-                    raw = b"".join(drained)
-                    if wav:
-                        wav.writeframes(raw)
-                    buf = np.concatenate([buf, to_mono_16k(raw, self.rate, self.channels)])
+                if self.mic_active:
+                    raw_m = self._drain(self.q_mic)
+                    if raw_m:
+                        mic16 = np.concatenate(
+                            [mic16, to_mono_16k(raw_m, self.mic_rate, self.mic_channels)])
+                    # Mix only what both sides have; carry remainders forward.
+                    n = min(len(spk16), len(mic16))
+                    if n:
+                        mixed = np.clip(spk16[:n] + mic16[:n], -1.0, 1.0)
+                        spk16, mic16 = spk16[n:], mic16[n:]
+                        emit(mixed)
+                else:
+                    emit(spk16)
+                    spk16 = np.zeros(0, dtype=np.float32)
 
                 while len(buf) >= chunk_n:
                     piece = buf[:chunk_n]
@@ -149,19 +270,23 @@ class LiveCapture:
 
                 time.sleep(0.4)
 
-            # Flush: grab anything still sitting in the queue, then transcribe
-            # whatever's left in buf even if it's short of a full chunk.
-            drained = []
-            try:
-                while True:
-                    drained.append(self.q.get_nowait())
-            except queue.Empty:
-                pass
-            if drained:
-                raw = b"".join(drained)
-                if wav:
-                    wav.writeframes(raw)
-                buf = np.concatenate([buf, to_mono_16k(raw, self.rate, self.channels)])
+            # Flush: drain everything, pad the shorter side with silence so
+            # no audio is dropped, mix, and transcribe the remainder.
+            raw = self._drain(self.q_spk)
+            if raw:
+                spk16 = np.concatenate(
+                    [spk16, to_mono_16k(raw, self.spk_rate, self.spk_channels)])
+            if self.mic_active:
+                raw_m = self._drain(self.q_mic)
+                if raw_m:
+                    mic16 = np.concatenate(
+                        [mic16, to_mono_16k(raw_m, self.mic_rate, self.mic_channels)])
+                n = max(len(spk16), len(mic16))
+                spk16 = np.pad(spk16, (0, n - len(spk16)))
+                mic16 = np.pad(mic16, (0, n - len(mic16)))
+                emit(np.clip(spk16 + mic16, -1.0, 1.0))
+            else:
+                emit(spk16)
             if len(buf) >= TARGET_SR // 2:   # only bother if at least ~0.5s remains
                 self._transcribe(buf, consumed / TARGET_SR)
         finally:
