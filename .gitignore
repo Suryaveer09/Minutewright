@@ -1,0 +1,23 @@
+Misc/
+# Conda / Python
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# App data — NEVER commit recordings. They contain other people's voices.
+recordings/
+*.wav
+
+# Packaging output (used later when we build an installer)
+build/
+dist/
+*.spec
+
+# Local machine / secrets
+.env
+Thumbs.db
+
+# VS Code
+.vscode/
+!.vscode/settings.json
