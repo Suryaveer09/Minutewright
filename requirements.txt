@@ -4,3 +4,7 @@ numpy>=1.26
 scipy>=1.11
 psutil
 pytest
+fastapi
+uvicorn
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

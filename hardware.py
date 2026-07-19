@@ -1,20 +1,78 @@
 """Detect this machine's CPU/GPU and choose the best Whisper model it can
 handle. Called once at startup; the choice is shown in the UI so the user
 always knows what their machine is running and why.
+
+Also owns the Windows CUDA-DLL workaround: pip-installed nvidia libraries
+aren't discoverable by the OS loader, so we preload them into the process.
 """
 
+import os
 import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import psutil
 
 
 @dataclass
 class ModelChoice:
-    model: str          # faster-whisper model name, e.g. "small"
+    model: str           # faster-whisper model name, e.g. "small"
     device: str          # "cuda" or "cpu"
     compute_type: str    # "float16", "int8_float16", "int8"
-    reason: str           # human-readable explanation shown in the UI
+    reason: str          # human-readable explanation shown in the UI
+
+
+def enable_cuda_dlls():
+    """Make pip-installed CUDA libraries actually loadable on Windows.
+
+    ctranslate2 delay-loads cublas/cudnn DLLs *by name* from C++ at first
+    inference. That lookup only checks modules already loaded into the
+    process and the PATH - it ignores os.add_dll_directory. So we do all
+    three: register the dirs, prepend them to PATH, and preload every DLL
+    with ctypes so by-name lookups resolve to already-loaded modules.
+
+    Returns the list of nvidia bin folders found (useful for diagnostics).
+    """
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    import site
+
+    roots = []
+    try:
+        roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    found = []
+    for root in roots:
+        nv = Path(root) / "nvidia"
+        if not nv.is_dir():
+            continue
+        for bin_dir in nv.glob("*/bin"):
+            if bin_dir.is_dir():
+                found.append(str(bin_dir))
+
+    for d in found:
+        try:
+            os.add_dll_directory(d)
+        except OSError:
+            pass
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
+    for d in found:
+        for dll in sorted(Path(d).glob("*.dll")):
+            try:
+                ctypes.WinDLL(str(dll))
+            except OSError:
+                pass  # some DLLs are optional or load-order sensitive; fine
+
+    return found
 
 
 def detect_gpu():
@@ -40,6 +98,7 @@ def detect_hardware():
         "cpu_cores": psutil.cpu_count(logical=True) or 4,
         "ram_gb": round(psutil.virtual_memory().total / 1_000_000_000, 1),
     }
+
 
 def choose_model(hw) -> ModelChoice:
     """Pick the largest model this machine can run comfortably in real time."""
