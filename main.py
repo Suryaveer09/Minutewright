@@ -3,8 +3,8 @@
 Wraps capture.LiveCapture behind an HTTP API so the desktop window (or
 anything else) can start/stop recordings, poll live captions, generate
 summaries, and chat with transcripts. The Whisper model loads in a
-background thread at startup so the server itself comes up instantly -
-the UI shows "loading model..." instead of hanging.
+background thread at startup; the LLM for summaries/chat is bundled
+in-process (llm.py) and its weights are downloaded in-app on first use.
 """
 
 import json
@@ -23,6 +23,7 @@ from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
 import chat as chatmod
+import llm
 import summarize as summarizer
 from capture import LiveCapture
 from hardware import choose_model, cpu_choice, detect_hardware, enable_cuda_dlls
@@ -140,6 +141,17 @@ def status():
     }
 
 
+@app.get("/api/llm/status")
+def llm_status():
+    return llm.get_status()
+
+
+@app.post("/api/llm/download")
+def llm_download():
+    llm.start_download()
+    return llm.get_status()
+
+
 @app.post("/api/record/start")
 def record_start():
     if STATE.capture is not None:
@@ -247,7 +259,7 @@ def make_summary(rec_id: str):
         raise HTTPException(400, "This recording has no transcript to summarize.")
     try:
         result = summarizer.summarize(text)
-    except summarizer.SummaryError as exc:
+    except llm.LLMError as exc:
         raise HTTPException(503, str(exc))
     (folder / "summary.md").write_text(result, encoding="utf-8")
     return {"summary": result}
@@ -264,7 +276,7 @@ def chat_with_recording(rec_id: str, req: ChatRequest):
         raise HTTPException(400, "Empty message.")
     try:
         reply = chatmod.chat(text, req.history, req.message.strip())
-    except summarizer.SummaryError as exc:
+    except llm.LLMError as exc:
         raise HTTPException(503, str(exc))
     return {"reply": reply}
 
