@@ -3,12 +3,14 @@
 <head>
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
-  - Polls /api/status every 2.5s (model badge, record-button enablement)
+  - Polls /api/status every 2.5s (Whisper badge, record-button enablement)
+  - Polls /api/llm/status (1s while downloading, 3s otherwise) for the
+    bundled LLM: missing -> downloading(progress) -> loading -> ready
   - Polls /api/live every 1.2s while recording (caption feed)
   - Library reads /api/recordings; detail plays /audio, shows /transcript,
-    generates/loads /summary, and chats via /chat (Ollama-backed, optional)
-  Chat history lives in this page's memory per opened recording; the
-  server is stateless and receives the history with every request.
+    generates/loads /summary, and chats via /chat
+  Summary and Chat are gated behind a one-time in-app model download
+  (~2 GB) so end users never touch a terminal or install anything extra.
 -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -131,6 +133,20 @@
   .tab.active{border-color:var(--amber); color:var(--ink)}
   .tab:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
 
+  /* LLM download gate */
+  .llm-gate{
+    display:none; background:var(--panel-2); border:1px dashed var(--amber-dim);
+    border-radius:8px; padding:16px; margin-top:10px; font-size:14px;
+  }
+  .llm-gate.show{display:block}
+  .llm-gate p{margin:0 0 10px; color:var(--ink-dim)}
+  .progress{
+    height:10px; background:var(--panel); border:1px solid var(--line);
+    border-radius:999px; overflow:hidden; margin:10px 0 6px;
+  }
+  .progress .fill{height:100%; width:0%; background:var(--amber); transition:width .4s}
+  .progress-label{font-family:var(--mono); font-size:12px; color:var(--ink-dim)}
+
   .pane{
     white-space:pre-wrap; background:var(--panel-2); border:1px solid var(--line);
     border-radius:8px; padding:14px; max-height:46vh; overflow-y:auto; margin-top:10px;
@@ -214,6 +230,14 @@
         <button class="tab" id="tabS">Summary</button>
         <button class="tab" id="tabC">Chat</button>
       </div>
+
+      <div class="llm-gate" id="llmGate">
+        <p id="llmGateText"></p>
+        <div class="progress" id="llmProg" style="display:none"><div class="fill" id="llmFill"></div></div>
+        <div class="progress-label" id="llmProgLabel" style="display:none"></div>
+        <button class="btn primary" id="llmBtn" style="display:none">Download AI model</button>
+      </div>
+
       <div class="pane mono" id="paneT"></div>
       <div class="pane body" id="paneS" style="display:none"></div>
 
@@ -234,7 +258,7 @@
   </section>
 </main>
 
-<footer>Runs entirely on this device. Audio, transcripts, summaries, and chats stay on this machine.</footer>
+<footer>Runs entirely on this device. Audio, transcripts, summaries, and chats never leave this machine.</footer>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -255,6 +279,9 @@ let openId = null;
 let delArmed = null;
 let chatHistory = [];   // [{role, content}] for the currently open recording
 let chatBusy = false;
+let sumBusy = false;
+let llmState = { state: 'missing' };
+let activeTab = 'T';
 
 function banner(msg) {
   const b = $('banner');
@@ -299,6 +326,55 @@ async function refreshStatus() {
     if (st.recording && !recording) enterRecording();  // engine was mid-recording
   } catch (e) { /* server still starting */ }
 }
+
+/* ---------- bundled LLM: status, download gate ---------- */
+function llmReady() { return llmState.state === 'ready'; }
+
+async function pollLlm() {
+  try { llmState = await api('/api/llm/status'); } catch (e) { /* server starting */ }
+  renderLlmGate();
+  // Poll fast while a download is running so the bar moves smoothly.
+  setTimeout(pollLlm, llmState.state === 'downloading' ? 1000 : 3000);
+}
+
+function renderLlmGate() {
+  if (!sumBusy) $('sumBtn').disabled = !llmReady();
+  if (!chatBusy) $('chatSend').disabled = !llmReady();
+
+  const gate = $('llmGate');
+  const relevant = (activeTab === 'S' || activeTab === 'C');
+  const show = relevant && !llmReady() && $('detail').classList.contains('open');
+  gate.classList.toggle('show', show);
+  if (!show) return;
+
+  const t = $('llmGateText'), btn = $('llmBtn');
+  const prog = $('llmProg'), fill = $('llmFill'), lbl = $('llmProgLabel');
+  prog.style.display = 'none'; lbl.style.display = 'none'; btn.style.display = 'none';
+
+  if (llmState.state === 'missing') {
+    t.textContent = 'Summaries and chat run on an AI model built into Minutewright. ' +
+      'Download it once (~2 GB) — after that it works fully offline and nothing ever leaves this device.';
+    btn.style.display = ''; btn.textContent = 'Download AI model';
+  } else if (llmState.state === 'downloading') {
+    t.textContent = 'Downloading the AI model — you can keep recording in the meantime.';
+    prog.style.display = ''; lbl.style.display = '';
+    fill.style.width = (llmState.progress || 0) + '%';
+    const doneMb = Math.round((llmState.downloaded || 0) / 1e6);
+    lbl.textContent = `${doneMb.toLocaleString()} MB of ${(llmState.size_mb || 2020).toLocaleString()} MB (${llmState.progress || 0}%)`;
+  } else if (llmState.state === 'loading') {
+    t.textContent = 'Loading the AI model into memory — just a few seconds…';
+  } else if (llmState.state === 'error') {
+    t.textContent = llmState.error || 'Model download failed.';
+    btn.style.display = ''; btn.textContent = 'Retry download';
+  }
+}
+
+$('llmBtn').addEventListener('click', async () => {
+  try {
+    llmState = await api('/api/llm/download', { method: 'POST' });
+    renderLlmGate();
+  } catch (e) { banner(e.message); }
+});
 
 /* ---------- recording ---------- */
 function enterRecording() {
@@ -416,11 +492,12 @@ $('dAudio').addEventListener('error', () => {
 /* ---------- tabs ---------- */
 function setSummary(text) {
   $('paneS').textContent = text ||
-    'No summary yet. Generate one below — it runs on a local model through Ollama.';
+    'No summary yet. Generate one below — it runs on the AI model built into this app.';
   $('sumBtn').textContent = text ? 'Regenerate summary' : 'Generate summary';
 }
 
 function showTab(which) {
+  activeTab = which;
   const map = { T: 'paneT', S: 'paneS', C: 'paneC' };
   for (const [key, paneId] of Object.entries(map)) {
     const active = key === which;
@@ -429,7 +506,8 @@ function showTab(which) {
     if (paneId === 'paneC') el.classList.toggle('open', active);
     else el.style.display = active ? '' : 'none';
   }
-  if (which === 'C') $('chatInput').focus();
+  renderLlmGate();
+  if (which === 'C' && llmReady()) $('chatInput').focus();
 }
 $('tabT').addEventListener('click', () => showTab('T'));
 $('tabS').addEventListener('click', () => showTab('S'));
@@ -437,10 +515,11 @@ $('tabC').addEventListener('click', () => showTab('C'));
 
 /* ---------- summary ---------- */
 $('sumBtn').addEventListener('click', async () => {
-  if (!openId) return;
+  if (!openId || !llmReady()) return;
   const btn = $('sumBtn');
+  sumBusy = true;
   btn.disabled = true;
-  btn.textContent = 'Summarizing… (can take a minute)';
+  btn.textContent = 'Summarizing… (a minute or two on CPU)';
   banner('');
   showTab('S');
   $('paneS').textContent = 'Thinking…';
@@ -453,7 +532,8 @@ $('sumBtn').addEventListener('click', async () => {
     const s = await api(`/api/recordings/${openId}/summary`).catch(() => ({summary: null}));
     setSummary(s.summary);
   }
-  btn.disabled = false;
+  sumBusy = false;
+  btn.disabled = !llmReady();
 });
 
 /* ---------- chat ---------- */
@@ -462,7 +542,7 @@ function renderChat(thinking) {
   if (!chatHistory.length && !thinking) {
     log.innerHTML = '<div class="chat-empty">Ask anything about this meeting — ' +
       '"what were the action items?", "what did they say about the budget?" ' +
-      'Answers come from a local model and only from this transcript.</div>';
+      'Answers come from the AI model built into this app, and only from this transcript.</div>';
     return;
   }
   log.innerHTML = chatHistory.map(m =>
@@ -474,7 +554,7 @@ function renderChat(thinking) {
 async function sendChat() {
   const input = $('chatInput');
   const text = input.value.trim();
-  if (!text || !openId || chatBusy) return;
+  if (!text || !openId || chatBusy || !llmReady()) return;
   chatBusy = true;
   input.value = '';
   $('chatSend').disabled = true;
@@ -497,7 +577,7 @@ async function sendChat() {
   }
   renderChat();
   chatBusy = false;
-  $('chatSend').disabled = false;
+  $('chatSend').disabled = !llmReady();
   $('chatInput').focus();
 }
 
@@ -530,6 +610,7 @@ $('delBtn').addEventListener('click', async () => {
 /* ---------- boot ---------- */
 refreshStatus();
 setInterval(refreshStatus, 2500);
+pollLlm();
 loadLibrary();
 </script>
 </body>
