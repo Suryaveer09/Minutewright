@@ -1,16 +1,18 @@
 # Minutewright — Build & Repository Guide
 
-> **Revision 2 (Jul 2026).** The target changed mid-build from a browser UI
-> to a **native desktop app**: a pywebview window over a local FastAPI
-> engine, packaged to `Minutewright.exe` in the final phase. A
-> chat-with-transcript feature was added before packaging. The workflow
-> uses **conda** and **cmd** (not venv/PowerShell). Phases 0-6 below are
-> written as they were actually completed — including the debugging
+> **Revision 3 (Jul 2026).** Phases 7 (Ollama summaries) and 8 (chat with
+> a transcript) are now recorded as built, including the Windows
+> event-loop noise fix. Phase 9 — packaging to `Minutewright.exe` — is
+> next. Earlier context: **Revision 2** changed the target from a browser
+> UI to a native desktop app (pywebview shell over a local FastAPI
+> engine) and switched the workflow to **conda** and **cmd**. Completed
+> phases are written as they actually happened — including the debugging
 > lessons — so the guide doubles as the project's engineering log.
 
 Minutewright is a local meeting recorder for Windows: it captures whatever
 the PC is playing (Teams, Zoom, anything), shows a live transcript, and
-stores audio, transcripts, and AI summaries entirely on the user's machine.
+stores audio, transcripts, AI summaries, and a chat-with-transcript
+assistant entirely on the user's machine.
 
 | Phase | Deliverable | Status |
 |-------|-------------|--------|
@@ -21,9 +23,9 @@ stores audio, transcripts, and AI summaries entirely on the user's machine.
 | 4 | Hardware detection → automatic model choice (+ tests) | Done |
 | 5 | FastAPI engine with record/live/library API | Done |
 | 6 | Native desktop window + full UI, audio playback | Done |
-| 7 | AI summaries via local Ollama | Next |
-| 8 | Chat with a transcript | Planned |
-| 9 | Package as standalone `Minutewright.exe`, release v0.1.0 | Planned |
+| 7 | AI summaries via local Ollama | Done |
+| 8 | Chat with a transcript | Done |
+| 9 | Package as standalone `Minutewright.exe`, release v0.1.0 | Next |
 
 Each phase ends with a **working checkpoint**, a **directory tree**, the
 **documentation to write**, and a **commit**. Commit at the end of every
@@ -378,7 +380,7 @@ pip install pywebview
 echo pywebview>=5.0 >> requirements.txt
 ```
 
-**desktop.py** — the app's real entry point (~30 lines): engine thread +
+**desktop.py** — the app's real entry point (~40 lines): engine thread +
 uvicorn thread, then `webview.create_window("Minutewright",
 "http://127.0.0.1:8737", ...)`. Closing the window exits the app;
 `main.py` remains the developer entry (`/docs` tester).
@@ -415,7 +417,121 @@ with screenshot and roadmap`
 recording → live captions stream during a talking video → stop
 auto-opens the new session → audio plays and the transcript reads clean.
 
-### Directory after Phase 6
+---
+
+## Phase 7 — AI summaries, still local  [DONE]
+
+**Goal (met):** one-click meeting minutes via a local LLM through
+[Ollama](https://ollama.com) — optional, and graceful when Ollama is
+absent. This phase also built the exact LLM plumbing Phase 8's chat
+reuses.
+
+### As built
+
+Setup: install Ollama for Windows (lives in the tray), then a one-time
+`ollama pull llama3.2:3b` (~2 GB). VRAM note for GPU machines: a 3B model
+takes ~2-3 GB alongside Whisper-medium's ~3-4 GB — both fit in 8 GB.
+
+```cmd
+pip install requests
+echo requests>=2.31 >> requirements.txt
+```
+
+- **summarize.py**: `pick_model()` queries `http://localhost:11434/api/tags`
+  and prefers small llama/qwen-class models (`SUMMARY_MODEL` env var
+  overrides); a fixed minutes prompt with exactly four sections (Overview /
+  Key points / Decisions / Action items) and an explicit "do not invent
+  details" rule; transcripts truncated to `MAX_CHARS = 24000` to fit a
+  small model's context (map-reduce summarization stays a roadmap item).
+  `SummaryError` carries a **user-facing, actionable** message ("install
+  from ollama.com, run 'ollama pull llama3.2:3b'") that the UI shows
+  verbatim — error messages as product copy, not stack traces.
+- **main.py**: `GET /api/recordings/{id}/summary`,
+  `POST /api/recordings/{id}/summarize` (saves `summary.md` in the session
+  folder), `has_summary` in the library listing. The summarize endpoint is
+  a plain `def` on purpose: FastAPI runs sync endpoints in a threadpool,
+  so a 60-second summary doesn't freeze the rest of the app.
+- **UI**: Transcript | Summary tabs, Generate/Regenerate button with a
+  working state, amber "summary" flag on library rows, Ollama errors in
+  the banner.
+
+Verified in practice: real recordings produced structured minutes, and the
+prompt's honesty rule held — sections with nothing to report came back as
+"None mentioned." rather than inventions. With Ollama quit from the tray,
+the endpoint returned a clean 503 with setup instructions — the
+graceful-absence behavior tested like the feature it is.
+
+### Side lesson: benign Windows disconnect noise
+
+Polling UIs constantly abandon in-flight HTTP requests (superseded polls,
+cancelled audio range requests). On Windows, asyncio's **Proactor** event
+loop logs each one as a scary `ConnectionResetError: [WinError 10054]`
+traceback — cosmetic, but it frightens users and buries real errors.
+Fixed in **desktop.py** with two layers: a targeted logging filter that
+silences exactly that error, and switching uvicorn's thread to
+`WindowsSelectorEventLoopPolicy`, which doesn't have the quirk (a
+localhost app needs nothing Proactor-specific).
+
+**Commits:** `feat: local meeting summaries via ollama (backend + api)` ·
+`feat: summary tab and generate button in desktop ui` · `fix: silence
+benign win32 connection-reset noise from polling ui` · `docs: readme after
+phase 7`
+
+**Done when (met):** with Ollama running, a recording produces structured
+minutes; with Ollama stopped, the button yields a helpful message, never a
+crash.
+
+---
+
+## Phase 8 — Chat with a transcript  [DONE]
+
+**Goal (met):** an in-app chat panel that answers questions about the open
+recording, using the same local LLM.
+
+### As built
+
+Key design decision, stated up front: **no RAG for v1.** A full hour-long
+meeting transcript is ~8-10k words and fits in a small local model's
+context window, so the transcript is stuffed into the system prompt and
+the conversation rides along with it. Embeddings + a vector store only
+become worth it for "search across *all* my meetings" — roadmap, not now.
+
+- **chat.py**: reuses `pick_model` / `OLLAMA_URL` / `SummaryError` from
+  summarize.py — one Ollama client, two features. The system prompt embeds
+  the transcript (same `MAX_CHARS` cap) with three rules: answer only from
+  the transcript, say plainly when something wasn't discussed, don't
+  invent names/numbers/dates. History is trimmed to the last
+  `MAX_HISTORY = 12` turns so long conversations can't blow a 3B model's
+  context — the transcript is the expensive part and is always included.
+  Uses Ollama's `/api/chat` (proper messages array) rather than
+  `/api/generate`.
+- **main.py**: `POST /api/recordings/{id}/chat` with a pydantic
+  `ChatRequest {message, history}`. The server is **stateless** — the UI
+  sends the running history with every request, consistent with everything
+  else in this app being plain files on disk. Ollama absence surfaces as
+  the same actionable 503.
+- **UI**: a Chat tab beside Transcript | Summary. Each recording opens a
+  **fresh conversation** (history is about *this* transcript; carrying it
+  across recordings would confuse the model). A "Thinking…" bubble shows
+  while the model works; the input locks during a request so overlapping
+  questions can't pile into a single-threaded local LLM; a failed send
+  **removes the question from history** so retrying doesn't double it.
+
+Verified: grounded questions answered from the transcript; a follow-up
+question proved multi-turn history flows; an off-transcript question got
+an honest "that wasn't discussed." Known caveat, documented rather than
+hidden: a 3B model's grounding is good-not-perfect — the `SUMMARY_MODEL`
+upgrade path (e.g. `qwen2.5:7b`) exists for exactly this.
+
+**Commits:** `feat: chat with a transcript via local llm (backend + api)` ·
+`feat: chat tab in desktop ui - per-recording history, thinking state` ·
+`docs: readme and api after phase 8`
+
+**Done when (met):** asking "what were the action items?" returns an
+answer grounded in that transcript; asking something not in the meeting
+gets an honest "that wasn't discussed."
+
+### Directory after Phase 8
 
 ```
 minutewright/
@@ -423,6 +539,8 @@ minutewright/
 ├── main.py              # FastAPI engine + endpoints (dev entry: /docs)
 ├── capture.py           # loopback capture, chunked live transcription, WAV
 ├── hardware.py          # CPU/GPU detection, model tiers, CUDA DLL loader
+├── summarize.py         # Ollama client + minutes prompt (optional feature)
+├── chat.py              # chat-with-transcript on the same Ollama client
 ├── live_console.py      # engine demo without server or UI (debugging)
 ├── static/
 │   └── index.html       # the whole UI, no build step
@@ -436,7 +554,8 @@ minutewright/
 │   ├── BUILD_GUIDE.md   # this file
 │   ├── API.md           # endpoint contract
 │   └── images/ui.png
-├── recordings/          # runtime data - gitignored
+├── recordings/          # runtime data - gitignored (audio.wav,
+│                        #   transcript.txt, meta.json, summary.md per id)
 ├── pytest.ini
 ├── requirements.txt
 ├── README.md
@@ -446,81 +565,7 @@ minutewright/
 
 ---
 
-## Phase 7 — AI summaries, still local  [NEXT]
-
-**Goal:** one-click meeting minutes via a local LLM through
-[Ollama](https://ollama.com) — optional, and graceful when Ollama is
-absent. This phase also builds the exact LLM plumbing Phase 8's chat
-reuses.
-
-Plan:
-
-```cmd
-pip install requests
-echo requests>=2.31 >> requirements.txt
-```
-
-- **summarize.py**: query `http://localhost:11434/api/tags` to find an
-  installed model (prefer small llama/qwen-class models; allow a
-  `SUMMARY_MODEL` env override); send the transcript with a fixed
-  minutes-format prompt (Overview / Key points / Decisions / Action items;
-  "do not invent details"); raise a `SummaryError` with an *actionable*
-  message when Ollama isn't running ("install from ollama.com, run
-  `ollama pull llama3.2:3b`") — the UI shows it verbatim.
-- **main.py**: `POST /api/recordings/{id}/summarize` → saves
-  `summary.md` into the session folder; `GET .../summary` returns it;
-  the recordings list gains `has_summary`.
-- **UI**: Transcript | Summary tabs in the detail view + a
-  "Generate summary" button with a working state (summaries on small
-  local models take tens of seconds).
-- Truncate very long transcripts to fit a small model's context; chunked
-  (map-reduce) summarization is a documented roadmap item, not v1.
-
-**Docs:** README "Summaries (optional)" section — install Ollama, pull a
-model, press the button; everything else works without it. API.md updated.
-
-**Commit:** `feat: local meeting summaries via ollama (optional)`
-
-**Done when:** with Ollama running, a recording produces structured
-minutes; with Ollama stopped, the button yields a helpful message, never a
-crash.
-
----
-
-## Phase 8 — Chat with a transcript  [PLANNED]
-
-**Goal:** an in-app chat panel that answers questions about the open
-recording, using the same local LLM.
-
-Key design decision, stated up front: **no RAG for v1.** A full hour-long
-meeting transcript is ~8-10k words and fits in a small local model's
-context window, so the transcript is stuffed into the system prompt and
-the conversation rides along with it. Embeddings + a vector store only
-become worth it for "search across *all* my meetings" — roadmap, not now.
-
-Plan:
-
-- **chat.py** (or extend summarize.py's Ollama client): build messages as
-  `[system: "You answer questions about this meeting transcript. If the
-  answer isn't in it, say so." + transcript] + history + new question`;
-  call `/api/chat` on Ollama; return the reply.
-- **main.py**: `POST /api/recordings/{id}/chat` accepting
-  `{history: [...], message: "..."}` — stateless server, the UI owns the
-  conversation history (consistent with everything else being files on
-  disk).
-- **UI**: a Chat tab beside Transcript | Summary — message list, input
-  box, thinking state; history lives in memory per opened recording.
-- Same graceful-absence behavior as summaries when Ollama is missing.
-
-**Commit:** `feat: chat with a transcript via local llm`
-
-**Done when:** asking "what were the action items?" about a real recording
-returns an answer grounded in that transcript, and asking something not in
-the meeting gets an honest "that wasn't discussed."
-
----
-
-## Phase 9 — Ship `Minutewright.exe`, release v0.1.0  [PLANNED]
+## Phase 9 — Ship `Minutewright.exe`, release v0.1.0  [NEXT]
 
 **Goal:** a stranger double-clicks one file and uses the app — no Python,
 no conda.
@@ -536,7 +581,8 @@ Plan:
   executable (Program Files isn't writable); code branches on
   `sys.frozen`.
 - Whisper models keep downloading to the user-profile cache on first run —
-  the exe stays hundreds of MB instead of gigabytes.
+  the exe stays hundreds of MB instead of gigabytes. Ollama remains a
+  separate user install for summaries/chat, documented in the README.
 - **Honest expectations to document in the README:** the exe will be a few
   hundred MB (Whisper runtime), first launch is slow (model download), and
   unsigned exes can trigger SmartScreen/antivirus warnings — normal for
