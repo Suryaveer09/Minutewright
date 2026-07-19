@@ -7,14 +7,17 @@ instantly - the UI can show "loading model..." instead of hanging.
 """
 
 import json
+import re
 import shutil
 import threading
 import traceback
+import wave
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
 from faster_whisper import WhisperModel
 
 from capture import LiveCapture
@@ -25,6 +28,7 @@ enable_cuda_dlls()
 BASE = Path(__file__).resolve().parent
 REC_DIR = BASE / "recordings"
 REC_DIR.mkdir(exist_ok=True)
+ID_RE = re.compile(r"^[0-9_\-]+$")
 
 
 class AppState:
@@ -88,6 +92,31 @@ def load_model_background():
 app = FastAPI(title="Minutewright")
 
 
+def rec_folder(rec_id: str) -> Path:
+    """Validate a recording id and return its folder, or raise 400/404.
+
+    The regex stops path tricks like '../../secrets' from ever touching
+    the filesystem - ids we generate are only digits, dashes, underscores.
+    """
+    if not ID_RE.match(rec_id):
+        raise HTTPException(400, "Bad recording id")
+    folder = REC_DIR / rec_id
+    if not folder.is_dir():
+        raise HTTPException(404, "Recording not found")
+    return folder
+
+
+@app.get("/")
+def index():
+    ui = BASE / "static" / "index.html"
+    if ui.exists():
+        return FileResponse(ui)
+    return HTMLResponse(
+        "<h1>Minutewright</h1><p>The UI lands in the next build step - "
+        "use <a href='/docs'>/docs</a> for now.</p>"
+    )
+
+
 @app.get("/api/status")
 def status():
     c = STATE.choice
@@ -113,7 +142,7 @@ def record_start():
     folder = REC_DIR / rec_id
     folder.mkdir(parents=True, exist_ok=True)
 
-    cap = LiveCapture(STATE.model)
+    cap = LiveCapture(STATE.model, wav_path=folder / "audio.wav")
     cap.start()
     STATE.capture = cap
     STATE.session_id = rec_id
@@ -135,10 +164,20 @@ def record_stop():
     )
     (folder / "transcript.txt").write_text(transcript, encoding="utf-8")
 
+    duration = 0.0
+    audio_file = folder / "audio.wav"
+    if audio_file.exists():
+        try:
+            with wave.open(str(audio_file)) as wf:
+                duration = wf.getnframes() / wf.getframerate()
+        except wave.Error:
+            pass
+
     meta = {
         "id": STATE.session_id,
         "title": "Meeting " + datetime.now().strftime("%b %d, %H:%M"),
         "lines": len(lines),
+        "duration_sec": round(duration, 1),
         "model": STATE.choice.model if STATE.choice else "?",
     }
     (folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -166,9 +205,17 @@ def recordings():
     return items
 
 
+@app.get("/api/recordings/{rec_id}/audio")
+def audio(rec_id: str):
+    f = rec_folder(rec_id) / "audio.wav"
+    if not f.exists():
+        raise HTTPException(404, "No audio saved for this recording")
+    return FileResponse(f, media_type="audio/wav", filename=f"{rec_id}.wav")
+
+
 @app.get("/api/recordings/{rec_id}/transcript")
 def transcript(rec_id: str):
-    f = REC_DIR / rec_id / "transcript.txt"
+    f = rec_folder(rec_id) / "transcript.txt"
     if not f.exists():
         raise HTTPException(404, "Recording not found")
     return {"text": f.read_text(encoding="utf-8")}
@@ -176,10 +223,7 @@ def transcript(rec_id: str):
 
 @app.delete("/api/recordings/{rec_id}")
 def delete_recording(rec_id: str):
-    folder = REC_DIR / rec_id
-    if not folder.is_dir():
-        raise HTTPException(404, "Recording not found")
-    shutil.rmtree(folder)
+    shutil.rmtree(rec_folder(rec_id))
     return {"ok": True}
 
 
