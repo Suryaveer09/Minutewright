@@ -5,7 +5,8 @@
   Minutewright UI. Deliberately framework-free: one file, plain JS.
   - Polls /api/status every 2.5s (model badge, record-button enablement)
   - Polls /api/live every 1.2s while recording (caption feed)
-  - Library reads /api/recordings; detail plays /audio and shows /transcript
+  - Library reads /api/recordings; detail plays /audio, shows /transcript,
+    and generates/loads /summary (Ollama-backed, optional)
   Runs inside the pywebview window (Edge WebView2), so modern JS is fine.
 -->
 <meta charset="UTF-8">
@@ -110,6 +111,7 @@
   .lib-item:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
   .lib-item.active{border-color:var(--amber)}
   .lib-item .meta{font-family:var(--mono); font-size:12px; color:var(--ink-dim); white-space:nowrap}
+  .lib-item .sum-flag{color:var(--amber)}
   .empty-lib{color:var(--ink-dim); font-size:14px}
 
   .detail{margin-top:18px; display:none}
@@ -118,19 +120,33 @@
   .detail .sub{font-family:var(--mono); font-size:12px; color:var(--ink-dim); margin-bottom:12px}
   audio{width:100%; margin-bottom:6px}
   .no-audio{display:none; color:var(--ink-dim); font-size:13px; margin-bottom:6px}
-  .pane{
-    white-space:pre-wrap; font-family:var(--mono); font-size:13px;
-    background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
-    padding:14px; max-height:48vh; overflow-y:auto; margin-top:8px;
+
+  .tabs{display:flex; gap:8px; margin-top:10px}
+  .tab{
+    background:none; border:1px solid var(--line); color:var(--ink-dim);
+    border-radius:999px; padding:6px 14px; font-family:var(--body);
+    font-size:13px; cursor:pointer;
   }
-  .actions{display:flex; gap:10px; margin-top:12px}
+  .tab.active{border-color:var(--amber); color:var(--ink)}
+  .tab:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+
+  .pane{
+    white-space:pre-wrap; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:8px; padding:14px; max-height:46vh; overflow-y:auto; margin-top:10px;
+  }
+  .pane.mono{font-family:var(--mono); font-size:13px}
+  .pane.body{font-size:14px}
+
+  .actions{display:flex; gap:10px; margin-top:12px; flex-wrap:wrap}
   .btn{
     border:1px solid var(--line); background:var(--panel-2); color:var(--ink);
     border-radius:8px; padding:8px 14px; font-family:var(--body); font-size:14px; cursor:pointer;
   }
   .btn:hover{border-color:var(--amber-dim)}
   .btn:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+  .btn.primary{border-color:var(--amber); color:var(--amber)}
   .btn.danger{color:var(--tally); border-color:var(--tally-deep)}
+  .btn[disabled]{opacity:.5; cursor:not-allowed}
 
   .banner{
     display:none; margin:14px 22px 0; padding:10px 14px; font-size:14px;
@@ -172,15 +188,23 @@
       <div class="sub" id="dSub"></div>
       <audio controls preload="metadata" id="dAudio"></audio>
       <div class="no-audio" id="noAudio">No audio saved for this recording (made before audio saving existed).</div>
-      <div class="pane" id="paneT"></div>
+
+      <div class="tabs">
+        <button class="tab active" id="tabT">Transcript</button>
+        <button class="tab" id="tabS">Summary</button>
+      </div>
+      <div class="pane mono" id="paneT"></div>
+      <div class="pane body" id="paneS" style="display:none"></div>
+
       <div class="actions">
+        <button class="btn primary" id="sumBtn">Generate summary</button>
         <button class="btn danger" id="delBtn">Delete recording</button>
       </div>
     </div>
   </section>
 </main>
 
-<footer>Runs entirely on this device. Audio and transcripts stay in the app's recordings folder.</footer>
+<footer>Runs entirely on this device. Audio, transcripts, and summaries stay in the app's recordings folder.</footer>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -316,7 +340,7 @@ async function loadLibrary() {
     const b = document.createElement('button');
     b.className = 'lib-item' + (it.id === openId ? ' active' : '');
     b.innerHTML = `<span>${esc(it.title || it.id)}</span>
-      <span class="meta">${fmt(it.duration_sec || 0)} · ${it.lines ?? 0} lines</span>`;
+      <span class="meta">${it.has_summary ? '<span class="sum-flag">summary · </span>' : ''}${fmt(it.duration_sec || 0)} · ${it.lines ?? 0} lines</span>`;
     b.addEventListener('click', () => openDetail(it.id, it));
     list.appendChild(b);
   });
@@ -337,8 +361,13 @@ async function openDetail(id, item) {
     $('noAudio').style.display = 'none';
     $('dAudio').style.display = '';
     $('dAudio').src = `/api/recordings/${id}/audio`;
+
     const t = await api(`/api/recordings/${id}/transcript`);
     $('paneT').textContent = t.text || 'Nothing transcribed — the audio may have been silent.';
+
+    const s = await api(`/api/recordings/${id}/summary`);
+    setSummary(s.summary);
+    showTab('T');
     await loadLibrary();
   } catch (e) { banner(e.message); }
 }
@@ -348,6 +377,43 @@ $('dAudio').addEventListener('error', () => {
   if (!openId) return;
   $('dAudio').style.display = 'none';
   $('noAudio').style.display = 'block';
+});
+
+/* ---------- summary tab ---------- */
+function setSummary(text) {
+  $('paneS').textContent = text ||
+    'No summary yet. Generate one below — it runs on a local model through Ollama.';
+  $('sumBtn').textContent = text ? 'Regenerate summary' : 'Generate summary';
+}
+
+function showTab(which) {
+  const t = which === 'T';
+  $('tabT').classList.toggle('active', t);
+  $('tabS').classList.toggle('active', !t);
+  $('paneT').style.display = t ? '' : 'none';
+  $('paneS').style.display = t ? 'none' : '';
+}
+$('tabT').addEventListener('click', () => showTab('T'));
+$('tabS').addEventListener('click', () => showTab('S'));
+
+$('sumBtn').addEventListener('click', async () => {
+  if (!openId) return;
+  const btn = $('sumBtn');
+  btn.disabled = true;
+  btn.textContent = 'Summarizing… (can take a minute)';
+  banner('');
+  showTab('S');
+  $('paneS').textContent = 'Thinking…';
+  try {
+    const res = await api(`/api/recordings/${openId}/summarize`, { method: 'POST' });
+    setSummary(res.summary);
+    await loadLibrary();
+  } catch (e) {
+    banner(e.message);
+    const s = await api(`/api/recordings/${openId}/summary`).catch(() => ({summary: null}));
+    setSummary(s.summary);
+  }
+  btn.disabled = false;
 });
 
 /* ---------- delete (two-click confirm; no native dialogs in webview) ---------- */
