@@ -1,9 +1,10 @@
 """FastAPI backend for Minutewright.
 
-Wraps capture.LiveCapture behind an HTTP API so a browser UI (or anything
-else) can start/stop recordings and poll live captions. The Whisper model
-loads in a background thread at startup so the server itself comes up
-instantly - the UI can show "loading model..." instead of hanging.
+Wraps capture.LiveCapture behind an HTTP API so the desktop window (or
+anything else) can start/stop recordings, poll live captions, and generate
+summaries. The Whisper model loads in a background thread at startup so the
+server itself comes up instantly - the UI shows "loading model..." instead
+of hanging.
 """
 
 import json
@@ -20,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from faster_whisper import WhisperModel
 
+import summarize as summarizer
 from capture import LiveCapture
 from hardware import choose_model, cpu_choice, detect_hardware, enable_cuda_dlls
 
@@ -201,7 +203,9 @@ def recordings():
     for d in sorted(REC_DIR.iterdir(), reverse=True):
         meta_file = d / "meta.json"
         if d.is_dir() and meta_file.exists():
-            items.append(json.loads(meta_file.read_text(encoding="utf-8")))
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            meta["has_summary"] = (d / "summary.md").exists()
+            items.append(meta)
     return items
 
 
@@ -219,6 +223,27 @@ def transcript(rec_id: str):
     if not f.exists():
         raise HTTPException(404, "Recording not found")
     return {"text": f.read_text(encoding="utf-8")}
+
+
+@app.get("/api/recordings/{rec_id}/summary")
+def get_summary(rec_id: str):
+    f = rec_folder(rec_id) / "summary.md"
+    return {"summary": f.read_text(encoding="utf-8") if f.exists() else None}
+
+
+@app.post("/api/recordings/{rec_id}/summarize")
+def make_summary(rec_id: str):
+    folder = rec_folder(rec_id)
+    t_file = folder / "transcript.txt"
+    text = t_file.read_text(encoding="utf-8").strip() if t_file.exists() else ""
+    if not text:
+        raise HTTPException(400, "This recording has no transcript to summarize.")
+    try:
+        result = summarizer.summarize(text)
+    except summarizer.SummaryError as exc:
+        raise HTTPException(503, str(exc))
+    (folder / "summary.md").write_text(result, encoding="utf-8")
+    return {"summary": result}
 
 
 @app.delete("/api/recordings/{rec_id}")
