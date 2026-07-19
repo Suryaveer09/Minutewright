@@ -6,8 +6,9 @@
   - Polls /api/status every 2.5s (model badge, record-button enablement)
   - Polls /api/live every 1.2s while recording (caption feed)
   - Library reads /api/recordings; detail plays /audio, shows /transcript,
-    and generates/loads /summary (Ollama-backed, optional)
-  Runs inside the pywebview window (Edge WebView2), so modern JS is fine.
+    generates/loads /summary, and chats via /chat (Ollama-backed, optional)
+  Chat history lives in this page's memory per opened recording; the
+  server is stateless and receives the history with every request.
 -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -137,6 +138,25 @@
   .pane.mono{font-family:var(--mono); font-size:13px}
   .pane.body{font-size:14px}
 
+  /* chat */
+  .chat{display:none; margin-top:10px}
+  .chat.open{display:block}
+  .chat-log{
+    background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
+    padding:14px; height:40vh; overflow-y:auto;
+  }
+  .msg{max-width:85%; margin-bottom:10px; padding:9px 12px; border-radius:10px; font-size:14px; white-space:pre-wrap}
+  .msg.user{margin-left:auto; background:rgba(229,176,74,.14); border:1px solid var(--amber-dim)}
+  .msg.bot{margin-right:auto; background:var(--panel); border:1px solid var(--line)}
+  .msg.thinking{color:var(--ink-dim); font-style:italic}
+  .chat-empty{color:var(--ink-dim); font-size:13px}
+  .chat-form{display:flex; gap:8px; margin-top:10px}
+  .chat-input{
+    flex:1; background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
+    color:var(--ink); font-family:var(--body); font-size:14px; padding:10px 12px;
+  }
+  .chat-input:focus-visible{outline:2px solid var(--amber); outline-offset:1px}
+
   .actions{display:flex; gap:10px; margin-top:12px; flex-wrap:wrap}
   .btn{
     border:1px solid var(--line); background:var(--panel-2); color:var(--ink);
@@ -192,9 +212,19 @@
       <div class="tabs">
         <button class="tab active" id="tabT">Transcript</button>
         <button class="tab" id="tabS">Summary</button>
+        <button class="tab" id="tabC">Chat</button>
       </div>
       <div class="pane mono" id="paneT"></div>
       <div class="pane body" id="paneS" style="display:none"></div>
+
+      <div class="chat" id="paneC">
+        <div class="chat-log" id="chatLog"></div>
+        <div class="chat-form">
+          <input class="chat-input" id="chatInput" type="text"
+                 placeholder="Ask about this meeting… (Enter to send)" />
+          <button class="btn primary" id="chatSend">Send</button>
+        </div>
+      </div>
 
       <div class="actions">
         <button class="btn primary" id="sumBtn">Generate summary</button>
@@ -204,7 +234,7 @@
   </section>
 </main>
 
-<footer>Runs entirely on this device. Audio, transcripts, and summaries stay in the app's recordings folder.</footer>
+<footer>Runs entirely on this device. Audio, transcripts, summaries, and chats stay on this machine.</footer>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -223,6 +253,8 @@ let livePoll = null, timerTick = null;
 let recStartMs = null;
 let openId = null;
 let delArmed = null;
+let chatHistory = [];   // [{role, content}] for the currently open recording
+let chatBusy = false;
 
 function banner(msg) {
   const b = $('banner');
@@ -349,6 +381,8 @@ async function loadLibrary() {
 async function openDetail(id, item) {
   openId = id;
   resetDelete();
+  chatHistory = [];               // fresh conversation per recording
+  renderChat();
   try {
     if (!item) {
       const items = await api('/api/recordings');
@@ -379,7 +413,7 @@ $('dAudio').addEventListener('error', () => {
   $('noAudio').style.display = 'block';
 });
 
-/* ---------- summary tab ---------- */
+/* ---------- tabs ---------- */
 function setSummary(text) {
   $('paneS').textContent = text ||
     'No summary yet. Generate one below — it runs on a local model through Ollama.';
@@ -387,15 +421,21 @@ function setSummary(text) {
 }
 
 function showTab(which) {
-  const t = which === 'T';
-  $('tabT').classList.toggle('active', t);
-  $('tabS').classList.toggle('active', !t);
-  $('paneT').style.display = t ? '' : 'none';
-  $('paneS').style.display = t ? 'none' : '';
+  const map = { T: 'paneT', S: 'paneS', C: 'paneC' };
+  for (const [key, paneId] of Object.entries(map)) {
+    const active = key === which;
+    $('tab' + key).classList.toggle('active', active);
+    const el = $(paneId);
+    if (paneId === 'paneC') el.classList.toggle('open', active);
+    else el.style.display = active ? '' : 'none';
+  }
+  if (which === 'C') $('chatInput').focus();
 }
 $('tabT').addEventListener('click', () => showTab('T'));
 $('tabS').addEventListener('click', () => showTab('S'));
+$('tabC').addEventListener('click', () => showTab('C'));
 
+/* ---------- summary ---------- */
 $('sumBtn').addEventListener('click', async () => {
   if (!openId) return;
   const btn = $('sumBtn');
@@ -416,6 +456,54 @@ $('sumBtn').addEventListener('click', async () => {
   btn.disabled = false;
 });
 
+/* ---------- chat ---------- */
+function renderChat(thinking) {
+  const log = $('chatLog');
+  if (!chatHistory.length && !thinking) {
+    log.innerHTML = '<div class="chat-empty">Ask anything about this meeting — ' +
+      '"what were the action items?", "what did they say about the budget?" ' +
+      'Answers come from a local model and only from this transcript.</div>';
+    return;
+  }
+  log.innerHTML = chatHistory.map(m =>
+    `<div class="msg ${m.role === 'user' ? 'user' : 'bot'}">${esc(m.content)}</div>`).join('');
+  if (thinking) log.innerHTML += '<div class="msg bot thinking">Thinking…</div>';
+  log.scrollTop = log.scrollHeight;
+}
+
+async function sendChat() {
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!text || !openId || chatBusy) return;
+  chatBusy = true;
+  input.value = '';
+  $('chatSend').disabled = true;
+  banner('');
+
+  const priorHistory = chatHistory.slice();   // history *before* this question
+  chatHistory.push({ role: 'user', content: text });
+  renderChat(true);
+
+  try {
+    const res = await api(`/api/recordings/${openId}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: priorHistory }),
+    });
+    chatHistory.push({ role: 'assistant', content: res.reply });
+  } catch (e) {
+    chatHistory.pop();            // question failed - remove it so retry is clean
+    banner(e.message);
+  }
+  renderChat();
+  chatBusy = false;
+  $('chatSend').disabled = false;
+  $('chatInput').focus();
+}
+
+$('chatSend').addEventListener('click', sendChat);
+$('chatInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
+
 /* ---------- delete (two-click confirm; no native dialogs in webview) ---------- */
 function resetDelete() {
   clearTimeout(delArmed);
@@ -434,6 +522,7 @@ $('delBtn').addEventListener('click', async () => {
     await api(`/api/recordings/${openId}`, { method: 'DELETE' });
     $('detail').classList.remove('open');
     openId = null;
+    chatHistory = [];
     await loadLibrary();
   } catch (e) { banner(e.message); }
 });

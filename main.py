@@ -1,10 +1,10 @@
 """FastAPI backend for Minutewright.
 
 Wraps capture.LiveCapture behind an HTTP API so the desktop window (or
-anything else) can start/stop recordings, poll live captions, and generate
-summaries. The Whisper model loads in a background thread at startup so the
-server itself comes up instantly - the UI shows "loading model..." instead
-of hanging.
+anything else) can start/stop recordings, poll live captions, generate
+summaries, and chat with transcripts. The Whisper model loads in a
+background thread at startup so the server itself comes up instantly -
+the UI shows "loading model..." instead of hanging.
 """
 
 import json
@@ -20,7 +20,9 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from faster_whisper import WhisperModel
+from pydantic import BaseModel
 
+import chat as chatmod
 import summarize as summarizer
 from capture import LiveCapture
 from hardware import choose_model, cpu_choice, detect_hardware, enable_cuda_dlls
@@ -92,6 +94,11 @@ def load_model_background():
 
 
 app = FastAPI(title="Minutewright")
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict] = []
 
 
 def rec_folder(rec_id: str) -> Path:
@@ -244,6 +251,22 @@ def make_summary(rec_id: str):
         raise HTTPException(503, str(exc))
     (folder / "summary.md").write_text(result, encoding="utf-8")
     return {"summary": result}
+
+
+@app.post("/api/recordings/{rec_id}/chat")
+def chat_with_recording(rec_id: str, req: ChatRequest):
+    folder = rec_folder(rec_id)
+    t_file = folder / "transcript.txt"
+    text = t_file.read_text(encoding="utf-8").strip() if t_file.exists() else ""
+    if not text:
+        raise HTTPException(400, "This recording has no transcript to chat about.")
+    if not req.message.strip():
+        raise HTTPException(400, "Empty message.")
+    try:
+        reply = chatmod.chat(text, req.history, req.message.strip())
+    except summarizer.SummaryError as exc:
+        raise HTTPException(503, str(exc))
+    return {"reply": reply}
 
 
 @app.delete("/api/recordings/{rec_id}")
