@@ -17,6 +17,7 @@ crafts meeting minutes.
 
 - Captures system audio through the speakers' WASAPI loopback device —
   records what you hear, so it works with any meeting app.
+- Transcribes locally with faster-whisper (OpenAI's open-source Whisper, reimplemented for speed). Nothing leaves the machine after the one-time model download.
 
 ## License
 
