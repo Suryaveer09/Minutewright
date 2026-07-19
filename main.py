@@ -1,10 +1,11 @@
 """FastAPI backend for Minutewright.
 
 Wraps capture.LiveCapture behind an HTTP API so the desktop window (or
-anything else) can start/stop recordings, poll live captions, generate
-summaries, and chat with transcripts. The Whisper model loads in a
-background thread at startup; the LLM for summaries/chat is bundled
-in-process (llm.py) and its weights are downloaded in-app on first use.
+anything else) can start/stop recordings, upload existing recordings,
+poll live captions, generate summaries, and chat with transcripts.
+The Whisper model loads in a background thread at startup; the LLM for
+summaries/chat is bundled in-process (llm.py) and its weights are
+downloaded in-app on first use.
 """
 
 import json
@@ -17,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
@@ -25,7 +26,7 @@ from pydantic import BaseModel
 import chat as chatmod
 import llm
 import summarize as summarizer
-from capture import LiveCapture
+from capture import LiveCapture, transcribe_file
 from hardware import choose_model, cpu_choice, detect_hardware, enable_cuda_dlls
 
 enable_cuda_dlls()
@@ -34,6 +35,18 @@ BASE = Path(__file__).resolve().parent
 REC_DIR = BASE / "recordings"
 REC_DIR.mkdir(exist_ok=True)
 ID_RE = re.compile(r"^[0-9_\-]+$")
+
+# Formats faster-whisper can decode out of the box (bundled FFmpeg via PyAV).
+AUDIO_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "video/mp4",     # Teams saves meeting recordings as .mp4
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "audio/webm",
+}
 
 
 class AppState:
@@ -51,6 +64,25 @@ class AppState:
 
 
 STATE = AppState()
+
+# One background transcription job at a time: uploads and live recording
+# share the single Whisper instance, and interleaving them would starve
+# live captions. v1 keeps them mutually exclusive and says so politely.
+_upload_lock = threading.Lock()
+UPLOAD = {"active": False, "id": None, "filename": None, "progress": 0.0,
+          "error": None, "done_id": None}
+
+
+def _upload_set(**kw):
+    with _upload_lock:
+        UPLOAD.update(kw)
+
+
+def upload_status() -> dict:
+    with _upload_lock:
+        s = dict(UPLOAD)
+    s["progress"] = round(s["progress"], 1)
+    return s
 
 
 def load_model_background():
@@ -116,6 +148,25 @@ def rec_folder(rec_id: str) -> Path:
     return folder
 
 
+def write_session_files(folder: Path, rec_id: str, title: str, lines: list,
+                        duration: float, source: str):
+    """Write transcript.txt + meta.json in the shape every feature expects."""
+    transcript = "\n".join(
+        f"[{int(l['t']//60):02d}:{int(l['t']%60):02d}] {l['text']}" for l in lines
+    )
+    (folder / "transcript.txt").write_text(transcript, encoding="utf-8")
+    meta = {
+        "id": rec_id,
+        "title": title,
+        "lines": len(lines),
+        "duration_sec": round(duration, 1),
+        "model": STATE.choice.model if STATE.choice else "?",
+        "source": source,
+    }
+    (folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+
 @app.get("/")
 def index():
     ui = BASE / "static" / "index.html"
@@ -156,6 +207,9 @@ def llm_download():
 def record_start():
     if STATE.capture is not None:
         raise HTTPException(409, "Already recording")
+    if upload_status()["active"]:
+        raise HTTPException(409, "An uploaded file is still being transcribed - "
+                                 "wait for it to finish before recording.")
     if STATE.model is None:
         raise HTTPException(503, "Speech model isn't loaded yet - check /api/status")
 
@@ -180,11 +234,6 @@ def record_stop():
     lines = STATE.capture.lines
     folder = STATE.session_folder
 
-    transcript = "\n".join(
-        f"[{int(l['t']//60):02d}:{int(l['t']%60):02d}] {l['text']}" for l in lines
-    )
-    (folder / "transcript.txt").write_text(transcript, encoding="utf-8")
-
     duration = 0.0
     audio_file = folder / "audio.wav"
     if audio_file.exists():
@@ -194,19 +243,73 @@ def record_stop():
         except wave.Error:
             pass
 
-    meta = {
-        "id": STATE.session_id,
-        "title": "Meeting " + datetime.now().strftime("%b %d, %H:%M"),
-        "lines": len(lines),
-        "duration_sec": round(duration, 1),
-        "model": STATE.choice.model if STATE.choice else "?",
-    }
-    (folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta = write_session_files(
+        folder, STATE.session_id,
+        "Meeting " + datetime.now().strftime("%b %d, %H:%M"),
+        lines, duration, source="live",
+    )
 
     STATE.capture = None
     STATE.session_id = None
     STATE.session_folder = None
     return meta
+
+
+# ------------------------------------------------------------ uploads
+@app.post("/api/upload")
+def upload_recording(file: UploadFile = File(...)):
+    if STATE.capture is not None:
+        raise HTTPException(409, "Stop the current recording before uploading a file.")
+    if upload_status()["active"]:
+        raise HTTPException(409, "Another upload is still being transcribed.")
+    if STATE.model is None:
+        raise HTTPException(503, "Speech model isn't loaded yet - check /api/status")
+
+    original = file.filename or "recording"
+    ext = Path(original).suffix.lower()
+    if ext not in AUDIO_TYPES:
+        raise HTTPException(400, "Unsupported file type. Use one of: "
+                                 + ", ".join(sorted(AUDIO_TYPES)))
+
+    rec_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    folder = REC_DIR / rec_id
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / f"audio{ext}"
+    try:
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(file.file, out)
+    finally:
+        file.file.close()
+
+    title = f"Upload · {Path(original).stem[:60]}"
+    _upload_set(active=True, id=rec_id, filename=original, progress=0.0, error=None)
+    threading.Thread(
+        target=_process_upload, args=(rec_id, folder, dest, title), daemon=True
+    ).start()
+    return {"id": rec_id}
+
+
+def _process_upload(rec_id: str, folder: Path, dest: Path, title: str):
+    try:
+        lines, duration = transcribe_file(
+            STATE.model, dest,
+            on_progress=lambda p: _upload_set(progress=p),
+        )
+        write_session_files(folder, rec_id, title, lines, duration, source="upload")
+        _upload_set(active=False, progress=100.0, done_id=rec_id)
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        print("Upload transcription failed:\n" + traceback.format_exc(limit=3))
+        _upload_set(
+            active=False,
+            error="Couldn't transcribe that file - it may be corrupted or an "
+                  "unsupported codec. Try converting it to .mp3 or .wav.",
+        )
+
+
+@app.get("/api/upload/status")
+def get_upload_status():
+    return upload_status()
 
 
 @app.get("/api/live")
@@ -230,10 +333,12 @@ def recordings():
 
 @app.get("/api/recordings/{rec_id}/audio")
 def audio(rec_id: str):
-    f = rec_folder(rec_id) / "audio.wav"
-    if not f.exists():
-        raise HTTPException(404, "No audio saved for this recording")
-    return FileResponse(f, media_type="audio/wav", filename=f"{rec_id}.wav")
+    folder = rec_folder(rec_id)
+    for ext, media in AUDIO_TYPES.items():
+        f = folder / f"audio{ext}"
+        if f.exists():
+            return FileResponse(f, media_type=media, filename=f"{rec_id}{ext}")
+    raise HTTPException(404, "No audio saved for this recording")
 
 
 @app.get("/api/recordings/{rec_id}/transcript")
@@ -283,6 +388,11 @@ def chat_with_recording(rec_id: str, req: ChatRequest):
 
 @app.delete("/api/recordings/{rec_id}")
 def delete_recording(rec_id: str):
+    if STATE.capture is not None and STATE.session_id == rec_id:
+        raise HTTPException(409, "Stop the recording before deleting it.")
+    st = upload_status()
+    if st["active"] and st["id"] == rec_id:
+        raise HTTPException(409, "This upload is still being transcribed.")
     shutil.rmtree(rec_folder(rec_id))
     return {"ok": True}
 

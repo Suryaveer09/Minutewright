@@ -4,13 +4,12 @@
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
   - Polls /api/status every 2.5s (Whisper badge, record-button enablement)
-  - Polls /api/llm/status (1s while downloading, 3s otherwise) for the
-    bundled LLM: missing -> downloading(progress) -> loading -> ready
+  - Polls /api/llm/status (1s while downloading, 3s otherwise)
+  - Polls /api/upload/status (1s while a job runs, 3s otherwise); when a
+    job completes, the new session opens itself in the Library
   - Polls /api/live every 1.2s while recording (caption feed)
-  - Library reads /api/recordings; detail plays /audio, shows /transcript,
-    generates/loads /summary, and chats via /chat
-  Summary and Chat are gated behind a one-time in-app model download
-  (~2 GB) so end users never touch a terminal or install anything extra.
+  Live recording and file uploads are mutually exclusive (one Whisper
+  instance); the buttons reflect that and the server enforces it.
 -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -81,6 +80,16 @@
   .rec-btn:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
   .rec-btn[disabled]{background:var(--panel-2); color:var(--ink-dim); cursor:not-allowed}
   .rec-btn.on{background:var(--panel-2); color:var(--ink); border:1px solid var(--tally)}
+  .upload-btn{
+    width:100%; margin-top:8px; padding:10px; border-radius:8px;
+    background:var(--panel-2); border:1px solid var(--line); color:var(--ink);
+    font-family:var(--body); font-size:14px; cursor:pointer;
+  }
+  .upload-btn:hover{border-color:var(--amber-dim)}
+  .upload-btn:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+  .upload-btn[disabled]{opacity:.5; cursor:not-allowed}
+  .up-status{display:none; margin-top:10px; font-size:13px; color:var(--ink-dim)}
+  .up-status.show{display:block}
   .timer{
     font-family:var(--mono); font-size:34px; text-align:center;
     margin:14px 0 6px; letter-spacing:.04em;
@@ -95,9 +104,16 @@
   @media (prefers-reduced-motion:reduce){.meter span,.badge.loading{animation:none !important}}
   .hint{color:var(--ink-dim); font-size:13px; text-align:center; margin:0 0 4px}
 
+  .progress{
+    height:10px; background:var(--panel); border:1px solid var(--line);
+    border-radius:999px; overflow:hidden; margin:8px 0 6px;
+  }
+  .progress .fill{height:100%; width:0%; background:var(--amber); transition:width .4s}
+  .progress-label{font-family:var(--mono); font-size:12px; color:var(--ink-dim)}
+
   .feed{
     margin-top:12px; border-top:1px solid var(--line); padding-top:12px;
-    max-height:46vh; overflow-y:auto; font-size:14px;
+    max-height:40vh; overflow-y:auto; font-size:14px;
   }
   .feed .row{margin-bottom:10px}
   .feed .ts{font-family:var(--mono); font-size:11px; color:var(--amber); display:block}
@@ -133,19 +149,12 @@
   .tab.active{border-color:var(--amber); color:var(--ink)}
   .tab:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
 
-  /* LLM download gate */
   .llm-gate{
     display:none; background:var(--panel-2); border:1px dashed var(--amber-dim);
     border-radius:8px; padding:16px; margin-top:10px; font-size:14px;
   }
   .llm-gate.show{display:block}
   .llm-gate p{margin:0 0 10px; color:var(--ink-dim)}
-  .progress{
-    height:10px; background:var(--panel); border:1px solid var(--line);
-    border-radius:999px; overflow:hidden; margin:10px 0 6px;
-  }
-  .progress .fill{height:100%; width:0%; background:var(--amber); transition:width .4s}
-  .progress-label{font-family:var(--mono); font-size:12px; color:var(--ink-dim)}
 
   .pane{
     white-space:pre-wrap; background:var(--panel-2); border:1px solid var(--line);
@@ -154,7 +163,6 @@
   .pane.mono{font-family:var(--mono); font-size:13px}
   .pane.body{font-size:14px}
 
-  /* chat */
   .chat{display:none; margin-top:10px}
   .chat.open{display:block}
   .chat-log{
@@ -206,18 +214,26 @@
   <section class="card deck" id="deck">
     <h2>Deck</h2>
     <button class="rec-btn" id="recBtn" disabled>Start recording</button>
+    <button class="upload-btn" id="upBtn" disabled>Upload a recording…</button>
+    <input type="file" id="upFile" hidden
+           accept=".wav,.mp3,.m4a,.mp4,.aac,.ogg,.flac,.webm">
+    <div class="up-status" id="upStatus">
+      <span id="upText"></span>
+      <div class="progress"><div class="fill" id="upFill"></div></div>
+      <div class="progress-label" id="upLabel"></div>
+    </div>
     <div class="timer" id="timer">00:00</div>
     <div class="meter" aria-hidden="true">
       <span></span><span></span><span></span><span></span><span></span><span></span>
       <span></span><span></span><span></span><span></span><span></span><span></span>
     </div>
-    <p class="hint">Captures what this PC plays — works with Teams, Zoom, anything.</p>
+    <p class="hint">Record what this PC plays, or upload a meeting file (Teams .mp4, phone .m4a, .mp3…).</p>
     <div class="feed" id="feed"><div class="empty">Live transcript appears here while recording.</div></div>
   </section>
 
   <section class="card">
     <h2>Library</h2>
-    <div class="lib-list" id="libList"><div class="empty-lib">No recordings yet — start one and it will appear here.</div></div>
+    <div class="lib-list" id="libList"><div class="empty-lib">No recordings yet — record or upload one and it will appear here.</div></div>
 
     <div class="detail" id="detail">
       <h3 id="dTitle"></h3>
@@ -273,14 +289,17 @@ const api = async (path, opts) => {
 };
 
 let recording = false;
+let whisperReady = false;
 let livePoll = null, timerTick = null;
 let recStartMs = null;
 let openId = null;
 let delArmed = null;
-let chatHistory = [];   // [{role, content}] for the currently open recording
+let chatHistory = [];
 let chatBusy = false;
 let sumBusy = false;
 let llmState = { state: 'missing' };
+let upState = { active: false };
+let upDoneSeen = null;
 let activeTab = 'T';
 
 function banner(msg) {
@@ -301,6 +320,13 @@ function fmt(sec) {
   return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+function updateDeckButtons() {
+  $('recBtn').disabled = !whisperReady || upState.active || (!recording && false);
+  if (!whisperReady || upState.active) $('recBtn').disabled = !recording ? true : false;
+  else if (!recording) $('recBtn').disabled = false;
+  $('upBtn').disabled = !whisperReady || recording || upState.active;
+}
+
 /* ---------- status / model badge ---------- */
 async function refreshStatus() {
   try {
@@ -309,7 +335,8 @@ async function refreshStatus() {
     if (st.model_error) {
       badge.className = 'badge err';
       badge.textContent = 'speech model failed — see console';
-      $('recBtn').disabled = true;
+      whisperReady = false;
+      updateDeckButtons();
       return;
     }
     if (!st.model_ready) {
@@ -317,12 +344,13 @@ async function refreshStatus() {
       badge.textContent = st.model
         ? `loading ${st.model} · ${st.device} — first run downloads the model`
         : 'detecting hardware…';
-      $('recBtn').disabled = true;
+      whisperReady = false;
     } else {
       badge.className = 'badge';
       badge.innerHTML = `<b>${esc(st.model)}</b> · ${esc(st.device)} · ${esc(st.reason || '')}`;
-      if (!recording) $('recBtn').disabled = false;
+      whisperReady = true;
     }
+    updateDeckButtons();
     if (st.recording && !recording) enterRecording();  // engine was mid-recording
   } catch (e) { /* server still starting */ }
 }
@@ -333,7 +361,6 @@ function llmReady() { return llmState.state === 'ready'; }
 async function pollLlm() {
   try { llmState = await api('/api/llm/status'); } catch (e) { /* server starting */ }
   renderLlmGate();
-  // Poll fast while a download is running so the bar moves smoothly.
   setTimeout(pollLlm, llmState.state === 'downloading' ? 1000 : 3000);
 }
 
@@ -376,16 +403,64 @@ $('llmBtn').addEventListener('click', async () => {
   } catch (e) { banner(e.message); }
 });
 
+/* ---------- uploads ---------- */
+async function pollUpload() {
+  try { upState = await api('/api/upload/status'); } catch (e) { /* server starting */ }
+  renderUpload();
+  setTimeout(pollUpload, upState.active ? 1000 : 3000);
+}
+
+function renderUpload() {
+  updateDeckButtons();
+  const box = $('upStatus');
+  if (upState.active) {
+    box.classList.add('show');
+    $('upText').textContent = `Transcribing "${upState.filename || 'upload'}" — better quality than live, worth the wait.`;
+    $('upFill').style.width = (upState.progress || 0) + '%';
+    $('upLabel').textContent = (upState.progress || 0) + '%';
+  } else {
+    box.classList.remove('show');
+    if (upState.error) { banner(upState.error); upState.error = null; }
+    if (upState.done_id && upState.done_id !== upDoneSeen) {
+      upDoneSeen = upState.done_id;
+      loadLibrary().then(() => openDetail(upDoneSeen));
+    }
+  }
+}
+
+$('upBtn').addEventListener('click', () => $('upFile').click());
+
+$('upFile').addEventListener('change', async () => {
+  const f = $('upFile').files[0];
+  $('upFile').value = '';
+  if (!f) return;
+  banner('');
+  const form = new FormData();
+  form.append('file', f);
+  $('upBtn').disabled = true;
+  $('upBtn').textContent = 'Uploading…';
+  try {
+    await api('/api/upload', { method: 'POST', body: form });
+    upState = { active: true, filename: f.name, progress: 0 };
+    renderUpload();
+  } catch (e) {
+    banner(e.message);
+  }
+  $('upBtn').textContent = 'Upload a recording…';
+  updateDeckButtons();
+});
+
 /* ---------- recording ---------- */
 function enterRecording() {
   recording = true;
-  recStartMs = recStartMs || Date.now();  // client-side timer; good enough for a display
+  recStartMs = recStartMs || Date.now();
   $('recBtn').textContent = 'Stop recording';
   $('recBtn').classList.add('on');
   $('recBtn').disabled = false;
   $('deck').classList.add('recording');
   $('dot').classList.add('rec');
   $('feed').innerHTML = '<div class="empty">Listening…</div>';
+  updateDeckButtons();
   livePoll = setInterval(pollLive, 1200);
   timerTick = setInterval(() => $('timer').textContent = fmt((Date.now() - recStartMs) / 1000), 500);
 }
@@ -399,6 +474,7 @@ function exitRecording() {
   $('recBtn').classList.remove('on');
   $('deck').classList.remove('recording');
   $('dot').classList.remove('rec');
+  updateDeckButtons();
 }
 
 async function pollLive() {
@@ -432,7 +508,7 @@ $('recBtn').addEventListener('click', async () => {
     banner(e.message);
     if (!recording) { exitRecording(); }
   }
-  $('recBtn').disabled = false;
+  updateDeckButtons();
 });
 
 /* ---------- library ---------- */
@@ -440,7 +516,7 @@ async function loadLibrary() {
   const items = await api('/api/recordings');
   const list = $('libList');
   if (!items.length) {
-    list.innerHTML = '<div class="empty-lib">No recordings yet — start one and it will appear here.</div>';
+    list.innerHTML = '<div class="empty-lib">No recordings yet — record or upload one and it will appear here.</div>';
     return;
   }
   list.innerHTML = '';
@@ -457,7 +533,7 @@ async function loadLibrary() {
 async function openDetail(id, item) {
   openId = id;
   resetDelete();
-  chatHistory = [];               // fresh conversation per recording
+  chatHistory = [];
   renderChat();
   try {
     if (!item) {
@@ -483,7 +559,6 @@ async function openDetail(id, item) {
 }
 
 $('dAudio').addEventListener('error', () => {
-  // Old sessions recorded before WAV saving existed have no audio file.
   if (!openId) return;
   $('dAudio').style.display = 'none';
   $('noAudio').style.display = 'block';
@@ -560,7 +635,7 @@ async function sendChat() {
   $('chatSend').disabled = true;
   banner('');
 
-  const priorHistory = chatHistory.slice();   // history *before* this question
+  const priorHistory = chatHistory.slice();
   chatHistory.push({ role: 'user', content: text });
   renderChat(true);
 
@@ -572,7 +647,7 @@ async function sendChat() {
     });
     chatHistory.push({ role: 'assistant', content: res.reply });
   } catch (e) {
-    chatHistory.pop();            // question failed - remove it so retry is clean
+    chatHistory.pop();
     banner(e.message);
   }
   renderChat();
@@ -611,6 +686,7 @@ $('delBtn').addEventListener('click', async () => {
 refreshStatus();
 setInterval(refreshStatus, 2500);
 pollLlm();
+pollUpload();
 loadLibrary();
 </script>
 </body>

@@ -9,6 +9,10 @@ uses (whisper.cpp's stream demo, RealtimeSTT, etc).
 
 If a wav_path is given, the raw captured audio is also written to disk
 incrementally, so even an hours-long meeting never has to fit in memory.
+
+Also home to transcribe_file(), used for user-uploaded recordings: one
+full-context pass over the whole file, which yields better transcripts
+than live chunking (no chunk-boundary garbling).
 """
 
 import queue
@@ -169,3 +173,29 @@ class LiveCapture:
             self.lines.append(line)
             mm, ss = divmod(int(start_s), 60)
             print(f"[{mm:02d}:{ss:02d}] {text}")
+
+
+def transcribe_file(model: WhisperModel, path, on_progress=None):
+    """Transcribe an uploaded audio/video file in ONE full-context pass.
+
+    faster-whisper decodes mp3/m4a/mp4/wav/ogg/flac/webm itself (bundled
+    FFmpeg via PyAV) - no external tools needed. Full-file transcription
+    uses default beam search and cross-segment context, so quality is
+    *better* than the live chunked path.
+
+    on_progress: optional callback taking percent (0-100), driven by each
+    segment's end time against the file's total duration.
+
+    Returns (lines, duration_sec) where lines is the same shape LiveCapture
+    produces: [{"t": seconds, "text": "..."}].
+    """
+    segments, info = model.transcribe(str(path), vad_filter=True)
+    duration = float(info.duration or 0.0)
+    lines = []
+    for s in segments:  # generator: iterating IS the transcription
+        text = s.text.strip()
+        if text:
+            lines.append({"t": float(s.start), "text": text})
+        if on_progress and duration:
+            on_progress(min(100.0, s.end / duration * 100.0))
+    return lines, duration
