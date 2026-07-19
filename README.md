@@ -17,7 +17,19 @@ crafts meeting minutes.
 
 - Captures system audio through the speakers' WASAPI loopback device —
   records what you hear, so it works with any meeting app.
-- Transcribes locally with faster-whisper (OpenAI's open-source Whisper, reimplemented for speed). Nothing leaves the machine after the one-time model download.
+- Transcribes locally with faster-whisper (OpenAI's open-source Whisper,
+  reimplemented for speed). Nothing leaves the machine after the one-time
+  model download.
+
+## Try it
+
+    conda activate minutewright
+    pip install -r requirements.txt
+    python live_console.py
+
+Play a meeting or video and captions will print roughly every 5 seconds.
+Known limitation right now: words at chunk boundaries can be cut off or
+garbled — this is fixed properly in a later phase with overlapping windows.
 
 ## License
 
