@@ -1,18 +1,35 @@
 # Minutewright — Build & Repository Guide
 
-> **Revision 3 (Jul 2026).** Phases 7 (Ollama summaries) and 8 (chat with
-> a transcript) are now recorded as built, including the Windows
-> event-loop noise fix. Phase 9 — packaging to `Minutewright.exe` — is
-> next. Earlier context: **Revision 2** changed the target from a browser
-> UI to a native desktop app (pywebview shell over a local FastAPI
-> engine) and switched the workflow to **conda** and **cmd**. Completed
-> phases are written as they actually happened — including the debugging
-> lessons — so the guide doubles as the project's engineering log.
+> **Revision 4 (Jul 2026) — shipped.** v0.1.0 is released: two Windows
+> editions (Standard/CPU and NVIDIA-GPU) on the Releases page. This guide
+> is the project's engineering log, written as things actually happened —
+> including the debugging lessons — so a future contributor (or future
+> you) can understand not just *what* the code does but *why* it's shaped
+> this way.
 
-Minutewright is a local meeting recorder for Windows: it captures whatever
-the PC is playing (Teams, Zoom, anything), shows a live transcript, and
-stores audio, transcripts, AI summaries, and a chat-with-transcript
-assistant entirely on the user's machine.
+Minutewright is a local meeting recorder for Windows. It records system audio
+and the microphone together, transcribes live, and offers AI summaries and
+chat-with-transcript — all on-device. It also imports existing recordings and
+supports click-to-seek transcripts.
+
+## Architecture at a glance
+
+- **desktop.py** — entry point. Runs the FastAPI engine + uvicorn in
+  background threads, opens the UI in a native pywebview window (Edge
+  WebView2). This is what PyInstaller packages.
+- **main.py** — the FastAPI engine: recording control, uploads, transcripts,
+  summaries, chat, settings. Model loads in a background thread at startup.
+- **capture.py** — WASAPI loopback + optional mic capture, mixed and
+  transcribed in chunks live; also `transcribe_file()` for uploads. All
+  transcription requests word timestamps (click-to-seek).
+- **hardware.py** — CPU/GPU detection → model-tier selection; owns the
+  Windows CUDA-DLL loader (dev site-packages *and* the frozen bundle).
+- **llm.py** — in-process LLM (llama-cpp-python) for summaries/chat, with an
+  in-app model downloader. No external services.
+- **summarize.py / chat.py** — prompts + calls over the shared LLM client.
+- **paths.py** — dev-vs-frozen path resolution; keeps user data out of the
+  executable and in `%LOCALAPPDATA%\Minutewright` when packaged.
+- **static/index.html** — the entire UI, framework-free, one file.
 
 | Phase | Deliverable | Status |
 |-------|-------------|--------|
@@ -23,541 +40,258 @@ assistant entirely on the user's machine.
 | 4 | Hardware detection → automatic model choice (+ tests) | Done |
 | 5 | FastAPI engine with record/live/library API | Done |
 | 6 | Native desktop window + full UI, audio playback | Done |
-| 7 | AI summaries via local Ollama | Done |
+| 7 | AI summaries (originally Ollama; later bundled) | Done |
 | 8 | Chat with a transcript | Done |
-| 9 | Package as standalone `Minutewright.exe`, release v0.1.0 | Next |
+| 9a | Bundled in-process LLM + in-app model download | Done |
+| 9b | Upload existing recordings, background transcription | Done |
+| 9c | Click-to-seek transcript with word timestamps | Done |
+| 9d | Microphone capture + mix, device selection | Done |
+| 9e | Nameable recordings | Done |
+| 9f | Central path resolution (clean packaged data) | Done |
+| 10 | Package to `Minutewright.exe`, two editions, release | Done |
 
-Each phase ends with a **working checkpoint**, a **directory tree**, the
-**documentation to write**, and a **commit**. Commit at the end of every
-phase — small commits with clear messages *are* documentation.
+## Documentation habits (applied every phase)
 
----
-
-## How this repo stays documented
-
-Four habits, applied every phase:
-
-1. **README.md is the front door.** It grows a little each phase. A stranger
-   reading only the README should know what the app does, how to run it, and
-   what state it's in. After every phase, the README is updated in full.
-2. **Every module opens with a docstring** answering *why does this file
-   exist* and *how does it work*, in 3-10 lines. Public functions get a
-   one-line docstring. Comments are reserved for the non-obvious (the WASAPI
-   loopback dance, resampling math, the CUDA DLL workaround) — not for
-   narrating ordinary code.
-3. **Spikes are kept, not deleted.** Proof-of-concept and diagnostic scripts
-   live in `spikes/` forever. They document what was learned and give future
-   contributors runnable, minimal examples of the hard tricks —
-   `gpu_check.py` earned its keep within a day of being written.
-4. **Commit messages follow `type: what and why`.** Types used here:
-   `chore`, `spike`, `feat`, `fix`, `docs`, `release`.
+1. **README is the front door**, updated in full each phase.
+2. **Every module opens with a docstring** on why it exists and how it works;
+   comments only for the non-obvious (loopback dance, resampling math, the
+   CUDA DLL workaround, the packaging path split).
+3. **Spikes are kept, not deleted** (`spikes/`) — runnable minimal examples of
+   the hard tricks. `gpu_check.py` earned its keep within a day.
+4. **Commit messages: `type: what and why`** — `chore`, `spike`, `feat`,
+   `fix`, `docs`, `refactor`, `build`, `release`.
 
 ---
 
-## Phase 0 — An empty repo done right  [DONE]
+## Phase 0 — Repo skeleton  [DONE]
 
-**Goal:** a public GitHub repo containing a license, a .gitignore, and a
-one-paragraph README. No code yet.
+Environment: conda + cmd (not venv/PowerShell), Python 3.11 (the range
+PyAudioWPatch ships wheels for). `.gitignore` created **before any code** —
+its most important line is `recordings/`, so a stray `git add .` after a test
+meeting can never publish other people's voices. License: Apache-2.0 (chosen
+for adoption; AGPL-3.0 is the switch to make before external contributions if
+"nobody may take it proprietary" ever becomes the goal — Apache is permissive
+and allows closed-source reuse).
 
-### Environment
-
-```cmd
-mkdir minutewright
-cd minutewright
-git init -b main
-conda create -n minutewright python=3.11 -y
-conda activate minutewright
-```
-
-Python 3.11 (3.10-3.12 range): that's what PyAudioWPatch ships wheels for.
-The conda env lives outside the project folder, so nothing env-related needs
-committing or ignoring by default.
-
-### .gitignore — create this before any code exists
-
-```gitignore
-# Conda / Python
-env/
-__pycache__/
-*.pyc
-*.pyo
-
-# App data — NEVER commit recordings. They contain other people's voices.
-recordings/
-*.wav
-
-# Packaging output
-build/
-dist/
-*.spec
-
-# Local machine / secrets
-.env
-Thumbs.db
-
-# VS Code
-.vscode/*
-!.vscode/settings.json
-```
-
-> **Why the recordings/ line matters:** one careless `git add .` after a
-> test meeting would publish coworkers' voices to the public internet. The
-> ignore rule makes that mistake impossible. Keep it forever.
-
-### LICENSE
-
-This project uses **Apache-2.0** (added via GitHub's license picker). Be
-clear-eyed about what that means: Apache is *permissive* — anyone may use,
-modify, sell, and redistribute the code, including inside closed-source
-products, provided they keep the copyright and license notices. If the goal
-ever becomes "nobody may take a modified version proprietary," the standard
-open-source answer is **AGPL-3.0** instead. Optionally add a one-line
-`NOTICE` file: `Minutewright — Copyright (c) 2026 <your name>`.
-
-### README stub, first commit, publish
-
-Create `README.md` (one-paragraph description + status line), put this
-guide at `docs/BUILD_GUIDE.md`, then:
-
-```cmd
-git add .
-git commit -m "chore: project skeleton - readme, license, gitignore, build guide"
-git remote add origin https://github.com/<YOUR-USERNAME>/minutewright.git
-git push -u origin main
-```
-
-> **If the GitHub repo was created with its own README/license** (the
-> checkboxes on the New Repository page), the histories are unrelated and a
-> plain push is rejected. Recover with:
-> `git pull origin main --allow-unrelated-histories`, resolve the README
-> merge conflict keeping your fuller version, commit, then push.
-
-### Directory after Phase 0
-
-```
-minutewright/
-├── .git/
-├── .gitignore
-├── LICENSE
-├── README.md
-└── docs/
-    └── BUILD_GUIDE.md
-```
-
-**Done when:** the repo renders README + LICENSE on github.com.
+Recovery note that came up: if the GitHub repo was created with its own
+README/license, histories are unrelated and a plain push is rejected — fix
+with `git pull origin main --allow-unrelated-histories`, resolve the README
+conflict keeping the fuller version, commit, push.
 
 ---
 
-## Phase 1 — Prove you can hear what the PC hears  [DONE]
+## Phase 1 — Hear what the PC hears  [DONE]
 
-**Goal:** record 5 seconds of system audio to `test.wav` via WASAPI
-loopback — the hardest platform-specific trick in the whole app.
-
-```cmd
-pip install PyAudioWPatch
-echo PyAudioWPatch>=0.2.12.5 > requirements.txt
-```
-
-Create **spikes/record_test.py**: Windows hides a "loopback" twin of every
-output device; PyAudioWPatch exposes it, so the default speakers can be
-opened *as an input* and capture exactly what the user hears — no Teams
-API, no virtual audio cables. The spike records 5 seconds and writes
-`test.wav` (gitignored by the `*.wav` rule).
-
-**Docs:** README gains a "How it works" section, first bullet about
-loopback capture.
-
-**Commit:** `spike: capture system audio via wasapi loopback`
-
-**Done when:** play a video, run the spike, and `test.wav` plays back that
-exact audio.
+`spikes/record_test.py`: Windows hides a "loopback" twin of every output
+device; PyAudioWPatch exposes it, so the default speakers open *as an input*
+and capture exactly what the user hears — no meeting-app API, no virtual
+cables. The hardest platform-specific trick in the app, proven first.
 
 ---
 
-## Phase 2 — Prove the model transcribes  [DONE]
+## Phase 2 — Transcribe locally  [DONE]
 
-**Goal:** turn `test.wav` into text locally.
-
-```cmd
-pip install faster-whisper
-echo faster-whisper>=1.0.3 >> requirements.txt
-```
-
-Create **spikes/transcribe_test.py**: load `WhisperModel("base",
-device="cpu", compute_type="int8")`, transcribe `test.wav` with
-`vad_filter=True`, print `[start] text` lines. First run downloads the
-model to the Hugging Face cache in the user profile — *not* into the repo;
-fully offline afterward. Record a clip with actual speech (music
-transcribes to garbage, correctly).
-
-**Commit:** `spike: transcribe wav locally with faster-whisper`
-
-**Done when:** the console prints a recognizable transcript.
+`spikes/transcribe_test.py`: faster-whisper (`base`, CPU, int8) with
+`vad_filter=True`. The model downloads once to the user-profile Hugging Face
+cache — never into the repo — and runs offline after.
 
 ---
 
-## Phase 3 — Live captions (first real module)  [DONE]
+## Phase 3 — Live captions  [DONE]
 
-**Goal:** captions print in the console *while* audio plays.
+`capture.py`, the engine. Design that stuck for the whole project:
 
-```cmd
-pip install numpy scipy
-echo numpy>=1.26 >> requirements.txt
-echo scipy>=1.11 >> requirements.txt
-```
-
-Create **capture.py** — the engine. Design:
-
-- The audio callback does *only* `queue.put(bytes)` and returns. Callbacks
-  run on a real-time audio thread; anything slow there causes crackle and
-  dropped audio.
+- The audio callback does *only* `queue.put(bytes)` and returns — callbacks
+  run on a real-time thread; anything slow there causes crackle/drops.
 - A worker thread drains the queue, converts to 16 kHz mono float32
-  (`to_mono_16k`: /32768 normalization, channel-mean downmix,
-  `resample_poly` with a gcd-reduced ratio), and buffers.
-- Every 5 s of buffered audio (`CHUNK_SECONDS`) is transcribed with
-  `vad_filter=True`, `beam_size=1`, `condition_on_previous_text=False`.
+  (`to_mono_16k`), buffers, and transcribes every ~5 s (`CHUNK_SECONDS`).
   Whisper isn't a streaming model — chunk-on-timer is how every live-Whisper
   app fakes it.
-- **On stop, flush**: drain the queue one last time and transcribe the
-  remaining partial buffer (if ≥ 0.5 s). Without this, the tail of every
-  recording is silently lost — found the hard way when a short test
-  produced an empty transcript.
+- **On stop, flush** the partial buffer, or the tail of every recording is
+  silently lost (found the hard way when a short test produced empty output).
 
-Create **live_console.py** — a ~25-line entry point (load model, start
-capture, Ctrl+C to stop) so the engine is testable with no server or UI.
-
-**Known limitation to document honestly:** words spanning chunk boundaries
-get cut or garbled; VAD correctly produces nothing for silent/music-only
-chunks. Both go in the README.
-
-**Commits:** `feat: live captions from system audio (capture engine)` ·
-`docs: add try-it instructions and known chunking limitation`
-
-**Done when:** captions of a playing video appear within ~5-8 s of the
-words being spoken.
+Known limits documented honestly: chunk-boundary words can garble; VAD
+correctly emits nothing for silent/music-only chunks.
 
 ---
 
-## Phase 4 — The machine picks its own model  [DONE]
+## Phase 4 — The machine picks its model  [DONE]
 
-**Goal:** detect CPU/GPU and choose the largest Whisper model the machine
-can run in real time — the app's signature install-time behavior.
-
-```cmd
-pip install psutil pytest
-echo psutil>=5.9 >> requirements.txt
-echo pytest>=8.0 >> requirements.txt
-```
-
-Create **hardware.py**:
-
-- `detect_gpu()` shells out to `nvidia-smi`. `FileNotFoundError` *is* the
-  detection result (no NVIDIA GPU), not an error.
-- `detect_hardware()` adds CPU cores + RAM via psutil.
-- `choose_model()` implements the tier table; `cpu_choice()` is deliberately
-  a separate function so the CUDA-failure fallback (Phase 5) can call it
-  directly and say *why*.
-
-| Hardware found | Model chosen |
-|---|---|
-| NVIDIA GPU, 9 GB+ VRAM | large-v3-turbo (float16) |
-| NVIDIA GPU, 6-9 GB VRAM | medium (float16) |
-| NVIDIA GPU, 3.5-6 GB VRAM | small (int8_float16) |
-| CPU, 8+ cores and 8 GB+ RAM | small (int8) |
-| CPU, 4+ cores | base (int8) |
-| Anything weaker | tiny (int8) |
-
-Thresholds leave headroom above each model's raw requirement because the
-OS, browser, and the meeting app itself share the same GPU memory.
-
-Create **tests/test_hardware.py** — selection is pure logic, so it's the
-easiest, highest-value thing to test (big GPU→turbo, this machine's real
-numbers→its expected pick, no GPU→small, weak CPU→tiny). And create
-**pytest.ini** in the project root:
-
-```ini
-[pytest]
-pythonpath = .
-```
-
-Without it, pytest can't import project-root modules from `tests/` and
-fails collection with `ModuleNotFoundError` — a standard structure quirk.
-
-**Commits:** `feat: auto-select whisper model from detected cpu/gpu` ·
-`docs: readme after phase 4` (adds the table above)
-
-**Done when:** `pytest` is green and a one-liner prints a sensible
-`ModelChoice` for the current machine.
+`hardware.py`: `nvidia-smi` for GPU (its absence *is* the "no GPU" signal),
+psutil for cores/RAM, a tier table, and a separate `cpu_choice()` so the later
+CUDA-failure fallback can call it and say *why*. Thresholds leave headroom
+above each model's raw need because the OS, browser, and meeting app share GPU
+memory. First tests in `tests/test_hardware.py`; `pytest.ini` sets
+`pythonpath = .` so tests import project-root modules.
 
 ---
 
-## Phase 5 — A backend the UI can talk to  [DONE]
+## Phase 5 — Backend + the CUDA battle  [DONE]
 
-**Goal:** the engine behind an HTTP API. FastAPI's free `/docs` page serves
-as the tester until the real UI exists.
+FastAPI engine, model loaded in a background thread so the server is instant.
+The hard-won lessons, documented so nobody pays twice:
 
-```cmd
-pip install fastapi uvicorn
-echo fastapi>=0.110 >> requirements.txt
-echo uvicorn>=0.29 >> requirements.txt
-```
-
-Create **main.py**: model loads in a background thread at startup (server
-up instantly; `/api/status` shows the chosen model *while it loads*), plus
-the endpoints — the authoritative contract lives in **docs/API.md**:
-status, record/start, record/stop (writes `transcript.txt` + `meta.json`
-to `recordings/<timestamp>/`), live (polled by the UI), recordings list,
-transcript fetch, delete. Recording ids are validated with
-`^[0-9_\-]+$` before touching the filesystem so crafted ids like `../..`
-can't escape the recordings folder.
-
-### Hard-won lessons of this phase (the CUDA battle)
-
-These cost real debugging time; they're documented so nobody pays twice.
-
-1. **GPU model loading succeeds even when the GPU can't run.**
-   `WhisperModel(..., device="cuda")` constructs fine; cuBLAS isn't touched
-   until the first inference — and `transcribe()` returns a *lazy
-   generator*, so even calling it does nothing until iterated. The app
-   therefore runs a forced dummy inference at startup
-   (`list(segments)` on 1 s of zeros) so a broken GPU path fails **at
-   launch**, where the fallback lives — not mid-meeting.
-2. **Windows can't find pip-installed CUDA DLLs.** `nvidia-cublas-cu12` /
-   `nvidia-cudnn-cu12` land in `site-packages\nvidia\*\bin`, which the OS
-   loader never searches — and ctranslate2 delay-loads `cublas64_12.dll`
-   *by name* from C++, a lookup that ignores `os.add_dll_directory`. The
-   fix is `hardware.enable_cuda_dlls()`: register the dirs, prepend them to
-   `PATH`, **and preload every DLL with `ctypes.WinDLL`** so by-name lookups
-   resolve against already-loaded modules.
-3. **Never swallow exceptions silently.** The first fallback implementation
-   caught the GPU error and discarded it, leaving only guesswork. Now the
-   traceback is printed to the console and exposed as `gpu_error` in
-   `/api/status`, and the fallback reason is appended to the model-choice
-   string users see.
-4. **Diagnose in isolation.** `spikes/gpu_check.py` prints which nvidia DLL
-   folders were found, then attempts one real GPU inference and reports
-   SUCCESS or the full traceback — seconds per iteration instead of
-   restarting the whole server.
-5. **Keep requirements.txt CPU-safe.** The nvidia packages are ~1 GB and
-   useless on CPU-only machines, so they are an *optional* install
-   documented in the README, not a hard requirement. The app handles both
-   worlds by design.
-
-**Commits:** `feat: fastapi backend with record/live/library endpoints; fix
-cuda dll loading on windows (ctypes preload) and flush partial audio chunk
-on stop` · `docs: readme and api contract after phase 5`
-
-**Done when:** the full loop works through `/docs` — start → live lines →
-stop → transcript fetched — with `/api/status` showing the GPU model and
-`gpu_error: null` (or a truthful CPU fallback reason).
+1. **GPU load succeeds even when the GPU can't run.** `WhisperModel(...,
+   device="cuda")` constructs fine; cuBLAS isn't touched until first
+   inference — and `transcribe()` returns a *lazy generator*, so even calling
+   it does nothing until iterated. Fix: a forced dummy inference
+   (`list(segments)` on 1 s of zeros) at startup, so a broken GPU path fails
+   at launch where the fallback lives, not mid-meeting.
+2. **Windows can't find pip-installed CUDA DLLs.** They land in
+   `site-packages\nvidia\*\bin`, which the OS loader never searches, and
+   ctranslate2 delay-loads `cublas64_12.dll` *by name* from C++ (ignoring
+   `os.add_dll_directory`). Fix: `enable_cuda_dlls()` registers the dirs,
+   prepends them to PATH, **and preloads every DLL with `ctypes.WinDLL`** so
+   by-name lookups resolve to already-loaded modules.
+3. **Never swallow exceptions silently** — the first fallback hid the error
+   and cost real time. The traceback now prints and is exposed as `gpu_error`
+   in `/api/status`.
+4. **Diagnose in isolation** — `spikes/gpu_check.py` prints the DLL folders
+   found, then attempts one real GPU inference: seconds per iteration instead
+   of restarting the server.
+5. **Keep requirements.txt CPU-safe** — the nvidia packages are ~1 GB and
+   useless on CPU-only machines, so they're an optional install.
 
 ---
 
-## Phase 6 — A real desktop app  [DONE]
+## Phase 6 — Real desktop app  [DONE]
 
-> Revised from the original "browser UI" plan. An .exe is a **packaging**
-> decision, not an architecture one: the FastAPI engine stays, and the UI
-> renders in a native window via **pywebview** (Edge WebView2) — own
-> taskbar entry, no browser chrome. PyInstaller wraps it in Phase 9.
-
-### 6a — audio becomes real + the window shell
-
-Until now the engine threw audio away after transcribing. Changes to
-**capture.py**: `LiveCapture(model, wav_path=...)` writes raw audio to the
-WAV **incrementally from the worker thread** (never the callback, never
-RAM-buffered — an hour-long meeting streams to disk), the WAV close lives
-in `try/finally` (the `wave` module only writes correct headers on
-`close()`, so a crash otherwise corrupts the file), and `_transcribe`
-catches per-chunk errors so **one bad chunk can no longer kill the whole
-meeting** — the exact failure mode of the cuBLAS crash.
-
-**main.py** gains `GET /api/recordings/{id}/audio` (FileResponse,
-`audio/wav`), real duration measured from the WAV into `meta.json`, and a
-`GET /` that serves `static/index.html` when present.
-
-```cmd
-pip install pywebview
-echo pywebview>=5.0 >> requirements.txt
-```
-
-**desktop.py** — the app's real entry point (~40 lines): engine thread +
-uvicorn thread, then `webview.create_window("Minutewright",
-"http://127.0.0.1:8737", ...)`. Closing the window exits the app;
-`main.py` remains the developer entry (`/docs` tester).
-
-### 6b — the interface
-
-**static/index.html** — one file, framework-free, plain JS:
-
-- Header: wordmark + model badge polling `/api/status` every 2.5 s
-  (pulses while loading, shows model · device · reason, disables the
-  record button until the model is genuinely ready).
-- Deck: record/stop button, client-side timer, animated meter
-  (reduced-motion respected), live caption feed polling `/api/live`
-  every 1.2 s with stick-to-bottom scrolling.
-- Library: sessions newest-first; detail view with `<audio controls>`
-  playback, the timestamped transcript, and delete.
-- **Two-click delete confirm** (button arms for 3 s) — native
-  `confirm()` dialogs are unreliable inside webview windows.
-- Old sessions recorded before 6a have no `audio.wav`; the audio
-  element's error handler swaps in an explanatory note instead of a
-  broken player.
-
-**Docs:** screenshot at `docs/images/ui.png`, embedded at the top of the
-README — the highest-value documentation a GitHub project has. README
-"Run the app" now leads with `python desktop.py`.
-
-**Commits:** `feat: save recording audio to wav and serve it for playback;
-survive per-chunk transcription errors` · `feat: native desktop window
-shell (pywebview); revise roadmap toward exe` · `feat: desktop ui - record
-deck, live transcript, library, playback` · `docs: readme after phase 6
-with screenshot and roadmap`
-
-**Done when (five-step test):** window opens → badge settles and enables
-recording → live captions stream during a talking video → stop
-auto-opens the new session → audio plays and the transcript reads clean.
+An .exe is a *packaging* decision, not an architecture one: the FastAPI engine
+stays, the UI renders in a native pywebview window. Audio became real
+(incremental WAV writing from the worker, `try/finally` close so a crash can't
+corrupt the header, per-chunk error isolation so one bad chunk can't kill a
+meeting). The UI: model badge, record deck with live feed, library with
+playback, two-click delete (native `confirm()` is unreliable in webview).
+Also fixed benign Windows `ConnectionResetError(10054)` console noise from
+polling, via a targeted log filter + `WindowsSelectorEventLoopPolicy`.
 
 ---
 
-## Phase 7 — AI summaries, still local  [DONE]
+## Phase 7–8 — Summaries & chat  [DONE]
 
-**Goal (met):** one-click meeting minutes via a local LLM through
-[Ollama](https://ollama.com) — optional, and graceful when Ollama is
-absent. This phase also built the exact LLM plumbing Phase 8's chat
-reuses.
-
-### As built
-
-Setup: install Ollama for Windows (lives in the tray), then a one-time
-`ollama pull llama3.2:3b` (~2 GB). VRAM note for GPU machines: a 3B model
-takes ~2-3 GB alongside Whisper-medium's ~3-4 GB — both fit in 8 GB.
-
-```cmd
-pip install requests
-echo requests>=2.31 >> requirements.txt
-```
-
-- **summarize.py**: `pick_model()` queries `http://localhost:11434/api/tags`
-  and prefers small llama/qwen-class models (`SUMMARY_MODEL` env var
-  overrides); a fixed minutes prompt with exactly four sections (Overview /
-  Key points / Decisions / Action items) and an explicit "do not invent
-  details" rule; transcripts truncated to `MAX_CHARS = 24000` to fit a
-  small model's context (map-reduce summarization stays a roadmap item).
-  `SummaryError` carries a **user-facing, actionable** message ("install
-  from ollama.com, run 'ollama pull llama3.2:3b'") that the UI shows
-  verbatim — error messages as product copy, not stack traces.
-- **main.py**: `GET /api/recordings/{id}/summary`,
-  `POST /api/recordings/{id}/summarize` (saves `summary.md` in the session
-  folder), `has_summary` in the library listing. The summarize endpoint is
-  a plain `def` on purpose: FastAPI runs sync endpoints in a threadpool,
-  so a 60-second summary doesn't freeze the rest of the app.
-- **UI**: Transcript | Summary tabs, Generate/Regenerate button with a
-  working state, amber "summary" flag on library rows, Ollama errors in
-  the banner.
-
-Verified in practice: real recordings produced structured minutes, and the
-prompt's honesty rule held — sections with nothing to report came back as
-"None mentioned." rather than inventions. With Ollama quit from the tray,
-the endpoint returned a clean 503 with setup instructions — the
-graceful-absence behavior tested like the feature it is.
-
-### Side lesson: benign Windows disconnect noise
-
-Polling UIs constantly abandon in-flight HTTP requests (superseded polls,
-cancelled audio range requests). On Windows, asyncio's **Proactor** event
-loop logs each one as a scary `ConnectionResetError: [WinError 10054]`
-traceback — cosmetic, but it frightens users and buries real errors.
-Fixed in **desktop.py** with two layers: a targeted logging filter that
-silences exactly that error, and switching uvicorn's thread to
-`WindowsSelectorEventLoopPolicy`, which doesn't have the quirk (a
-localhost app needs nothing Proactor-specific).
-
-**Commits:** `feat: local meeting summaries via ollama (backend + api)` ·
-`feat: summary tab and generate button in desktop ui` · `fix: silence
-benign win32 connection-reset noise from polling ui` · `docs: readme after
-phase 7`
-
-**Done when (met):** with Ollama running, a recording produces structured
-minutes; with Ollama stopped, the button yields a helpful message, never a
-crash.
+Originally built on Ollama (a separate local service), with graceful absence
+when it wasn't running. Chat uses the same client; **no RAG** — an hour-long
+transcript (~8-10k words) fits a small model's context, so it rides in the
+system prompt and the UI sends history each turn (stateless server). These
+were later re-based onto the bundled engine (Phase 9a) so users install
+nothing.
 
 ---
 
-## Phase 8 — Chat with a transcript  [DONE]
+## Phase 9 — Making it a product
 
-**Goal (met):** an in-app chat panel that answers questions about the open
-recording, using the same local LLM.
+### 9a — Bundled LLM + in-app download
+Replaced Ollama with **llama-cpp-python** running in-process, so end users
+install nothing. Model weights (~2 GB GGUF, Llama 3.2 3B) download *from the
+app* on first use with a progress bar — the same pattern Whisper already used.
+Inference is CPU (works everywhere; GPU offload is roadmap). Single instance,
+serialized requests. States surfaced to the UI: missing → downloading →
+loading → ready (or error). Attribution: "Built with Llama" per the license.
 
-### As built
+### 9b — Upload existing recordings
+`transcribe_file()` does one full-context pass — better quality than live
+chunking (no boundary garbling) — for any format faster-whisper decodes
+(mp3/m4a/mp4/wav/…, via bundled FFmpeg/PyAV). Runs as a background job with
+progress; uploads and live recording are mutually exclusive (one Whisper
+instance). This is also the answer for locked-down work laptops that won't run
+outside apps: record on the phone, transcribe here.
 
-Key design decision, stated up front: **no RAG for v1.** A full hour-long
-meeting transcript is ~8-10k words and fits in a small local model's
-context window, so the transcript is stuffed into the system prompt and
-the conversation rides along with it. Embeddings + a vector store only
-become worth it for "search across *all* my meetings" — roadmap, not now.
+### 9c — Click-to-seek transcript
+All transcription now requests `word_timestamps=True`. Sessions save
+`lines.json` (structured, word-timed); the UI makes each word a seek target
+and highlights the playing line. Old sessions fall back to line-level seeking
+parsed from `transcript.txt`.
 
-- **chat.py**: reuses `pick_model` / `OLLAMA_URL` / `SummaryError` from
-  summarize.py — one Ollama client, two features. The system prompt embeds
-  the transcript (same `MAX_CHARS` cap) with three rules: answer only from
-  the transcript, say plainly when something wasn't discussed, don't
-  invent names/numbers/dates. History is trimmed to the last
-  `MAX_HISTORY = 12` turns so long conversations can't blow a 3B model's
-  context — the transcript is the expensive part and is always included.
-  Uses Ollama's `/api/chat` (proper messages array) rather than
-  `/api/generate`.
-- **main.py**: `POST /api/recordings/{id}/chat` with a pydantic
-  `ChatRequest {message, history}`. The server is **stateless** — the UI
-  sends the running history with every request, consistent with everything
-  else in this app being plain files on disk. Ollama absence surfaces as
-  the same actionable 503.
-- **UI**: a Chat tab beside Transcript | Summary. Each recording opens a
-  **fresh conversation** (history is about *this* transcript; carrying it
-  across recordings would confuse the model). A "Thinking…" bubble shows
-  while the model works; the input locks during a request so overlapping
-  questions can't pile into a single-threaded local LLM; a failed send
-  **removes the question from history** so retrying doesn't double it.
+### 9d — Microphone capture + device selection
+The app's original #1 limitation, closed. The mic is a second stream with its
+own queue; both are converted to 16 kHz mono and summed (clip-protected). The
+saved WAV is the mixed mono track, so playback has both sides. Mic on by
+default with a toggle; speaker + mic pickers; soft failure (missing/busy mic →
+system-audio-only + a banner, never a dead button). Headphones advised to
+avoid the mic re-hearing remote voices.
 
-Verified: grounded questions answered from the transcript; a follow-up
-question proved multi-turn history flows; an off-transcript question got
-an honest "that wasn't discussed." Known caveat, documented rather than
-hidden: a 3B model's grounding is good-not-perfect — the `SUMMARY_MODEL`
-upgrade path (e.g. `qwen2.5:7b`) exists for exactly this.
+### 9e — Nameable recordings
+Display titles in `meta.json` (the folder id — a timestamp — never moves, so
+renaming can't break audio paths or summaries). Inline editor, Enter/Escape,
+auto-opens after Stop and after an upload completes; Rename stays available
+forever.
 
-**Commits:** `feat: chat with a transcript via local llm (backend + api)` ·
-`feat: chat tab in desktop ui - per-recording history, thinking state` ·
-`docs: readme and api after phase 8`
+### 9f — Central path resolution
+`paths.py` splits `resource_dir()` (bundled read-only assets) from
+`data_dir()` (user-writable). Critical for packaging: a one-file exe unpacks
+to a temp folder Windows deletes on exit, so data written "next to the code"
+would vanish; and Program Files isn't writable. Packaged builds put data in
+`%LOCALAPPDATA%\Minutewright`, which also guarantees a **clean app** — the exe
+is program only, the user's machine grows its own data folder, and updates
+never touch recordings.
 
-**Done when (met):** asking "what were the action items?" returns an
-answer grounded in that transcript; asking something not in the meeting
-gets an honest "that wasn't discussed."
+---
 
-### Directory after Phase 8
+## Phase 10 — Ship it  [DONE]
+
+PyInstaller, driven by `build_exe.py` (batch wrapper `build_exe.bat`). Key
+decisions and lessons:
+
+- **`--onedir`, not one-file.** With ~1 GB of AI runtime, one-file re-extracts
+  to temp on every launch (slow) and trips antivirus more.
+- **Only `static/` is bundled data** — no recordings, no models, no settings.
+  The clean-app guarantee is visible right in the build command.
+- **`--collect-all`** for llama_cpp, faster_whisper, ctranslate2, webview —
+  their native DLLs / data files aren't seen by the import scanner.
+- **Two editions.** GPU edition bundles the CUDA DLLs by locating each
+  `nvidia/*/bin` and passing `--add-binary` (the nvidia wheels are data-style
+  packages `--collect-all` mishandles). `enable_cuda_dlls()` learned to scan
+  the frozen bundle (`resource_dir()`) as well as site-packages, so the same
+  loader serves dev, the CPU exe (finds nothing, falls back), and the GPU exe
+  (finds the bundled DLLs, runs on cuda). Both editions are safe on the wrong
+  hardware thanks to the Phase 5 fallback logic — the CPU exe on an NVIDIA box
+  falls back cleanly; the GPU exe on a non-NVIDIA box just carries dead weight.
+- **`build\` vs `dist\`.** A late scare: the app "wouldn't open on
+  double-click." Cause was running the exe from `build\` (PyInstaller scratch,
+  not a complete app — it can't find `python311.dll`). The real product is
+  always in `dist\`. Also added `os.chdir(exe_dir)` when frozen as
+  belt-and-suspenders against odd launch working directories, and disabled the
+  WebView2 right-click dev menu for release.
+- **Release:** windowed builds of both editions, zipped, tagged `v0.1.0`, and
+  published on GitHub with a "which download?" chooser and a SmartScreen note
+  (unsigned apps warn on first run — "More info → Run anyway"; code signing is
+  a paid, later step).
+
+Final directory:
 
 ```
 minutewright/
-├── desktop.py           # native-window entry point (the future .exe)
-├── main.py              # FastAPI engine + endpoints (dev entry: /docs)
-├── capture.py           # loopback capture, chunked live transcription, WAV
+├── desktop.py           # native-window entry point (packaged to exe)
+├── main.py              # FastAPI engine + endpoints
+├── capture.py           # loopback + mic capture, mix, chunked transcription,
+│                        #   word timestamps, transcribe_file() for uploads
 ├── hardware.py          # CPU/GPU detection, model tiers, CUDA DLL loader
-├── summarize.py         # Ollama client + minutes prompt (optional feature)
-├── chat.py              # chat-with-transcript on the same Ollama client
+├── llm.py               # in-process LLM + in-app model downloader
+├── summarize.py         # minutes prompt over the shared LLM client
+├── chat.py              # chat-with-transcript over the shared LLM client
+├── paths.py             # dev-vs-frozen path resolution
 ├── live_console.py      # engine demo without server or UI (debugging)
+├── build_exe.py         # PyInstaller build logic (both editions)
+├── build_exe.bat        # thin wrapper over build_exe.py
 ├── static/
 │   └── index.html       # the whole UI, no build step
 ├── spikes/
-│   ├── record_test.py   # minimal WASAPI loopback proof
+│   ├── record_test.py
 │   ├── transcribe_test.py
-│   └── gpu_check.py     # GPU-path diagnostic (DLL dirs + real inference)
+│   └── gpu_check.py
 ├── tests/
 │   └── test_hardware.py
 ├── docs/
 │   ├── BUILD_GUIDE.md   # this file
-│   ├── API.md           # endpoint contract
+│   ├── API.md
 │   └── images/ui.png
-├── recordings/          # runtime data - gitignored (audio.wav,
-│                        #   transcript.txt, meta.json, summary.md per id)
+├── recordings/          # runtime data — gitignored (dev only; packaged app
+│                        #   uses %LOCALAPPDATA%\Minutewright)
+├── models/              # LLM weights — gitignored (dev only; same as above)
+├── settings.json        # per-machine prefs — gitignored
 ├── pytest.ini
-├── requirements.txt
+├── requirements.txt     # app deps only (NOT pyinstaller, NOT nvidia-*)
+├── CHANGELOG.md
 ├── README.md
 ├── LICENSE
 └── .gitignore
@@ -565,68 +299,25 @@ minutewright/
 
 ---
 
-## Phase 9 — Ship `Minutewright.exe`, release v0.1.0  [NEXT]
-
-**Goal:** a stranger double-clicks one file and uses the app — no Python,
-no conda.
-
-Plan:
-
-- `pip install pyinstaller`, then build from **desktop.py** with
-  `--add-data static;static` (and a `.spec` file once flags stabilize —
-  `*.spec` is already gitignored as build output; the final spec gets
-  force-added when it becomes source).
-- **Frozen-app path handling:** when running as an exe, `recordings/` and
-  logs move to `%LOCALAPPDATA%\Minutewright\` instead of next to the
-  executable (Program Files isn't writable); code branches on
-  `sys.frozen`.
-- Whisper models keep downloading to the user-profile cache on first run —
-  the exe stays hundreds of MB instead of gigabytes. Ollama remains a
-  separate user install for summaries/chat, documented in the README.
-- **Honest expectations to document in the README:** the exe will be a few
-  hundred MB (Whisper runtime), first launch is slow (model download), and
-  unsigned exes can trigger SmartScreen/antivirus warnings — normal for
-  unsigned software; code-signing is a paid, later step.
-- Windows-only remains true and stated plainly.
-- **CHANGELOG.md** with a `## 0.1.0` section; tag and release:
-
-```cmd
-git add .
-git commit -m "release: v0.1.0 - packaged desktop app, changelog"
-git tag -a v0.1.0 -m "First packaged release"
-git push && git push --tags
-```
-
-Then GitHub → Releases → draft from the tag, paste the changelog, attach
-the exe (or a zip of the dist folder).
-
-**Done when:** on a machine (or clean folder) without the conda env,
-double-clicking `Minutewright.exe` reaches a working record → transcript →
-summary → chat loop.
-
----
-
 ## After v0.1.0 — working like a maintainer
 
-- **Branch per feature:** `git switch -c feat/mic-mixing`, push, open a PR
-  to yourself, merge. Keeps `main` always-working for anyone who clones.
-- **Issues as the roadmap**, seeded from the known limitations: mix the
-  user's own microphone in (currently system audio only — remote voices,
-  not yours), speaker labels via pyannote, word-level streaming captions
-  (RealtimeSTT / overlapping windows), map-reduce summaries for long
-  meetings, cross-meeting search (the actual RAG use case), code signing.
-- **CONTRIBUTING.md** the day a stranger opens their first issue, not
-  before.
+- **Branch per feature** from now on (`git switch -c feat/...`), PR to
+  yourself, merge — keeps `main` always-working for anyone who clones.
+- **Issues as the roadmap**, seeded from the known limits: GPU-accelerated
+  summaries/chat (or an in-app "enable GPU" CUDA download, the slicker v0.2
+  option that was deferred at the finish line); word-level streaming captions;
+  speaker labels via diarization; chunked (map-reduce) summaries for long
+  meetings; cross-meeting search (the real RAG use case); dual-track
+  native-quality recording; code signing.
+- **CONTRIBUTING.md** the day a stranger opens their first issue, not before.
 
-## Naming & license note (checked July 2026)
+## Naming & license note (checked Jul 2026)
 
-Candidates rejected during the name search: *Earshot* (existing classroom
-audio-transcription startup, podcast platform, hearing-aid app), *Susurrus*
-(existing Whisper-based transcription GUI on GitHub), *MinuteDeck* (one
-letter from MinuteDock, an established time tracker). *Minutewright*
-surfaced zero apps, repos, or products. Before publishing widely,
-re-verify: GitHub search, both app stores, a domain lookup, and — if ever
-commercializing — a proper trademark search (USPTO for the US). The
-license is Apache-2.0 by deliberate choice (adoption over exclusivity);
-AGPL-3.0 remains the switch to make *before* accepting external
-contributions if that goal changes. None of this is legal advice.
+Rejected names during the search: *Earshot* (existing classroom
+transcription startup, podcast platform, hearing-aid app), *Susurrus*
+(existing Whisper GUI on GitHub), *MinuteDeck* (one letter from MinuteDock, a
+time tracker). *Minutewright* surfaced clean. Before wider publishing,
+re-verify GitHub, both app stores, a domain lookup, and — if commercializing —
+a proper trademark search (USPTO for the US). License is Apache-2.0 by choice;
+AGPL-3.0 is the pre-contribution switch if that goal changes. None of this is
+legal advice.

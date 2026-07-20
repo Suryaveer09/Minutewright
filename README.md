@@ -1,14 +1,15 @@
 # Minutewright
 
-A local meeting recorder for Windows. It captures whatever your PC is playing
-(Teams, Zoom, Meet...), shows a live transcript while you record, and stores
-audio, transcripts, and AI summaries entirely on your machine. No cloud, no
-accounts, no extra installs — the AI is built in. You can even chat with a
-transcript to ask what you missed.
+A local meeting recorder for Windows. It records both sides of your meetings,
+transcribes them live, and lets you summarize and chat with the transcript —
+all running entirely on your machine. No cloud, no accounts, nothing leaves
+your device. You can also upload existing recordings, and click any word in a
+transcript to jump the audio to that moment.
 
 ![Minutewright UI](docs/images/ui.png)
 
-**Status:** early development. Build progress is tracked in
+**Latest release:** see the [Releases page](../../releases) for downloadable
+Windows builds. Build progress and architecture are documented in
 [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
 
 ## Why "Minutewright"
@@ -16,59 +17,84 @@ transcript to ask what you missed.
 A wright is a craftsman — wheelwright, playwright, shipwright. This one
 crafts meeting minutes.
 
-## How it works
+## For users: download and run
 
-- Captures system audio through the speakers' WASAPI loopback device —
-  records what you hear, so it works with any meeting app.
-- Transcribes locally with faster-whisper (OpenAI's open-source Whisper,
-  reimplemented for speed). Nothing leaves the machine after the one-time
-  model download.
-- Detects the CPU/GPU on first run and automatically picks the largest
-  Whisper model that machine can handle in real time — no configuration
-  needed. If a GPU is present but its CUDA libraries can't run inference,
-  the app verifies this at startup and falls back to a CPU model instead
-  of crashing mid-meeting.
-- **AI summaries and chat are built in.** A local language model
-  (Llama 3.2 3B) runs *inside* the app — no Ollama, no accounts, no
-  terminal. The model downloads once (~2 GB) from a button in the app,
-  with a progress bar, then works fully offline.
-- **Chat with any recording**: ask "what were the action items?" and get
-  answers grounded only in that meeting's transcript — with an honest
-  "that wasn't discussed" when the answer isn't there.
-- A native desktop window (pywebview) over a local FastAPI engine — see
-  [docs/API.md](docs/API.md) for the endpoint contract.
+Grab a build from the [Releases page](../../releases):
 
-## Run the app
+- **Most people: the Standard build.** Works on every Windows PC.
+- **Have an NVIDIA graphics card?** The NVIDIA-GPU build transcribes much
+  faster. If unsure, get Standard — it runs everywhere.
 
-    conda activate minutewright
-    pip install -r requirements.txt
-    python desktop.py
+Extract the zip and double-click the exe. Windows only (10/11, 64-bit). On
+first launch, SmartScreen may warn because the app isn't code-signed yet —
+click **More info → Run anyway**.
 
-A native Minutewright window opens: press **Start recording** during any
-meeting or video, watch the live transcript, stop, then play back audio,
-read transcripts, generate summaries, and chat — all from the Library.
-Recordings land in `recordings/<id>/`; the AI model lives in `models/`.
+Everything is on-device: recordings, the AI model, and settings live in
+`%LOCALAPPDATA%\Minutewright`. The Whisper speech model downloads on first
+recording (a few hundred MB); the summary/chat model downloads from a button
+in the app the first time you use those features (~2 GB). Both are one-time
+and offline afterward.
 
-Developer mode (API tester instead of the window): `python main.py`, then
-visit http://127.0.0.1:8737/docs.
+## Features
 
-The first time you open the Summary or Chat tab, the app offers a one-time
-**Download AI model (~2 GB)** button. Summaries and chat run on CPU so they
-work on every machine: expect a minute or two per summary (longer on
-modest hardware). GPU-accelerated generation is on the roadmap.
+- **Records the whole meeting** — system audio *and* your microphone, mixed
+  together, so both sides are captured. Works with Teams, Zoom, Meet, or
+  anything that plays through your PC. Choose your speaker and mic, or turn
+  the mic off, in the app.
+- **Live transcript** while recording, via faster-whisper (OpenAI's
+  open-source Whisper, reimplemented for speed).
+- **Automatic model selection** — detects your CPU/GPU and picks the largest
+  Whisper model that runs in real time, with a safe fallback to CPU if a
+  GPU's drivers can't run inference.
+- **Upload existing recordings** (.mp3, .m4a, .mp4, .wav, .aac, .ogg, .flac,
+  .webm) for a full, high-quality transcript — useful when a locked-down work
+  laptop won't run outside apps.
+- **Click-to-seek transcript** — click any word to jump the audio there; the
+  current line highlights as it plays.
+- **AI summaries and chat**, on a language model built into the app
+  (Llama 3.2 3B) — no Ollama, no setup. Downloads once, runs offline.
+- **Name, play back, and manage** recordings from the Library.
+
+## Run from source (developers)
+
+```
+conda create -n minutewright python=3.11 -y
+conda activate minutewright
+pip install -r requirements.txt
+python desktop.py
+```
+
+A native window opens. Developer mode (API tester instead of the window):
+`python main.py`, then visit http://127.0.0.1:8737/docs. The endpoint contract
+is in [docs/API.md](docs/API.md).
 
 ### Optional: GPU acceleration for transcription (NVIDIA)
 
-The default install transcribes on CPU everywhere. If you have an NVIDIA
-card, install the CUDA runtime libraries for a large speed and accuracy
-boost to live transcription:
+The default install transcribes on CPU everywhere. With an NVIDIA card,
+install the CUDA runtime libraries for a large speed boost to live
+transcription:
 
-    pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
 
-The app finds and loads these automatically at startup (including the
-Windows DLL-discovery workaround), verifies real GPU inference works, and
-falls back to CPU with a clear reason if it doesn't.
-To check your GPU path in isolation: `python spikes/gpu_check.py`.
+The app finds and loads these automatically at startup (including the Windows
+DLL-discovery workaround), verifies real GPU inference works, and falls back
+to CPU with a clear reason if it doesn't. To check the GPU path in isolation:
+`python spikes/gpu_check.py`.
+
+### Building the executables
+
+```
+build_exe.bat            :: Standard edition (CPU), windowed
+build_exe.bat debug      :: Standard, console visible for debugging
+build_exe.bat gpu        :: GPU edition (bundles NVIDIA CUDA DLLs)
+build_exe.bat gpu debug  :: GPU, console visible
+```
+
+Output lands in `dist\Minutewright\` or `dist\Minutewright-GPU\` — distribute
+the whole folder, zipped. (The `build\` folder is disposable scratch; the
+runnable app is always in `dist\`.)
 
 ## How the transcription model is chosen
 
@@ -81,23 +107,29 @@ To check your GPU path in isolation: `python spikes/gpu_check.py`.
 | CPU, 4+ cores                    | base (int8)               |
 | Anything weaker                  | tiny (int8)               |
 
-## Roadmap
+## Known limitations & roadmap
 
-- Package as a standalone `Minutewright.exe`
-- GPU-accelerated summaries and chat (optional, like transcription)
-- Mix in the user's own microphone (currently records system audio only)
-- Full-length summaries for very long meetings (chunked map-reduce)
-- Search across all meetings
+Current limits: summaries and chat run on CPU in both editions (a minute or
+two per summary); live captions arrive in ~5-second chunks; uploaded files
+transcribe more cleanly than live recording; no speaker labels; for the
+cleanest recording use headphones so your mic doesn't re-hear the meeting.
+
+Roadmap: GPU-accelerated summaries and chat; word-level streaming captions;
+speaker labels (who said what) via diarization; chunked summaries for very
+long meetings; search across all meetings; code signing to remove the
+SmartScreen warning.
 
 ## Running the tests
 
-    pytest
+```
+pytest
+```
 
 ## Attribution
 
-AI summaries and chat are **Built with Llama** — Meta Llama 3.2, used
-under the Llama 3.2 Community License. Speech recognition uses OpenAI's
-open-source Whisper via faster-whisper.
+Speech recognition uses OpenAI's open-source Whisper via faster-whisper.
+AI summaries and chat are **Built with Llama** (Meta Llama 3.2, used under the
+Llama 3.2 Community License).
 
 ## License
 
