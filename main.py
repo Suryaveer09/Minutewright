@@ -5,8 +5,13 @@ anything else) can start/stop recordings, upload existing recordings,
 poll live captions, generate summaries, and chat with transcripts.
 The Whisper model loads in a background thread at startup; the LLM for
 summaries/chat is bundled in-process (llm.py) and its weights are
-downloaded in-app on first use. Audio-device choices (which speakers to
-loop back, which mic, mic on/off) persist in settings.json.
+downloaded in-app on first use. Audio-device choices persist in
+settings.json.
+
+Paths: bundled assets (static/) resolve via paths.resource_dir(); user
+data (recordings/, settings.json) via paths.data_dir(), which moves to
+%LOCALAPPDATA%\\Minutewright in packaged builds so the exe stays clean
+and user data survives app updates.
 """
 
 import json
@@ -29,12 +34,14 @@ import llm
 import summarize as summarizer
 from capture import LiveCapture, list_devices, transcribe_file
 from hardware import choose_model, cpu_choice, detect_hardware, enable_cuda_dlls
+from paths import data_dir, resource_dir
 
 enable_cuda_dlls()
 
-BASE = Path(__file__).resolve().parent
-REC_DIR = BASE / "recordings"
-REC_DIR.mkdir(exist_ok=True)
+BASE = resource_dir()          # bundled, read-only (static/)
+DATA = data_dir()              # user-writable (recordings/, settings.json)
+REC_DIR = DATA / "recordings"
+REC_DIR.mkdir(parents=True, exist_ok=True)
 ID_RE = re.compile(r"^[0-9_\-]+$")
 TS_LINE_RE = re.compile(r"^\[(\d+):(\d{2})\]\s?(.*)$")
 
@@ -51,7 +58,7 @@ AUDIO_TYPES = {
 }
 
 # ------------------------------------------------------------- settings
-SETTINGS_FILE = BASE / "settings.json"
+SETTINGS_FILE = DATA / "settings.json"
 DEFAULT_SETTINGS = {"capture_mic": True, "mic_index": None, "loopback_index": None}
 _settings_lock = threading.Lock()
 

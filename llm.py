@@ -19,6 +19,8 @@ from pathlib import Path
 import psutil
 import requests
 
+from paths import data_dir
+
 MODEL_NAME = "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 MODEL_URL = (
     "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF"
@@ -26,7 +28,7 @@ MODEL_URL = (
 )
 MODEL_SIZE_BYTES = 2_020_000_000  # ~2.02 GB, fallback if no Content-Length
 
-MODELS_DIR = Path(__file__).resolve().parent / "models"  # Phase 10: branch to %LOCALAPPDATA% when frozen
+MODELS_DIR = data_dir() / "models"   # dev: project folder; exe: %LOCALAPPDATA%\Minutewright
 MODEL_PATH = MODELS_DIR / MODEL_NAME
 
 N_CTX = 8192          # transcript (~4k tokens) + history + answer fits
@@ -84,7 +86,7 @@ def start_download():
 
 
 def _download():
-    MODELS_DIR.mkdir(exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
     part = MODEL_PATH.with_suffix(".gguf.part")
     try:
         with requests.get(MODEL_URL, stream=True, timeout=(10, 120)) as resp:
