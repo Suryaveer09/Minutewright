@@ -2,8 +2,22 @@
 
 Runs the FastAPI engine in a background thread and opens the UI in a
 native window (pywebview -> Edge WebView2 on Windows). No browser, no
-tabs - this is what gets packaged into Minutewright.exe later.
+tabs - this is what gets packaged into Minutewright.exe.
 """
+
+import os
+import sys
+
+# CRITICAL - must run before any other imports that touch the filesystem.
+# When a packaged exe is launched by double-clicking in File Explorer,
+# Windows may set the working directory to somewhere unrelated (often
+# System32), not the exe's folder. Any cwd-relative path then resolves
+# wrong, startup throws, and a windowless exe dies silently before the
+# window appears - which looks like "double-click does nothing, but it
+# works from the command line". Anchoring cwd to the exe's own directory
+# up front removes the whole class of bug.
+if getattr(sys, "frozen", False):
+    os.chdir(os.path.dirname(sys.executable))
 
 import asyncio
 import logging
@@ -46,13 +60,24 @@ if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     time.sleep(1.0)  # small grace period so the first page load hits a live server
 
-    webview.create_window(
+    window = webview.create_window(
         "Minutewright",
         f"http://127.0.0.1:{PORT}",
         width=1100,
         height=760,
         min_size=(800, 560),
     )
-    webview.start()
+
+    # Disable the WebView2 right-click developer menu (Reload / Inspect /
+    # Open in File Explorer) - a dev convenience that shouldn't ship.
+    def _harden():
+        try:
+            window.evaluate_js(
+                "document.addEventListener('contextmenu', e => e.preventDefault());"
+            )
+        except Exception:
+            pass
+
+    webview.start(_harden)
     # webview.start() blocks until the window closes; the daemon threads
     # (server + model) die with the process - closing the window exits the app.

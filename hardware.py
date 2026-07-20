@@ -3,7 +3,8 @@ handle. Called once at startup; the choice is shown in the UI so the user
 always knows what their machine is running and why.
 
 Also owns the Windows CUDA-DLL workaround: pip-installed nvidia libraries
-aren't discoverable by the OS loader, so we preload them into the process.
+(dev) or bundle-shipped ones (GPU edition of the exe) aren't discoverable
+by the OS loader, so we preload them into the process.
 """
 
 import os
@@ -14,6 +15,8 @@ from pathlib import Path
 
 import psutil
 
+from paths import is_frozen, resource_dir
+
 
 @dataclass
 class ModelChoice:
@@ -23,8 +26,42 @@ class ModelChoice:
     reason: str          # human-readable explanation shown in the UI
 
 
+def _nvidia_bin_dirs() -> list:
+    """Every nvidia/*/bin folder we can find, in priority order.
+
+    Frozen (packaged) runs look inside the bundle first: the GPU edition
+    ships the DLLs at <bundle>/nvidia/<lib>/bin via --add-binary, and
+    resource_dir() is exactly the bundle root (sys._MEIPASS). Dev runs
+    (and the Standard exe, which finds nothing and falls back) also scan
+    site-packages, where pip installs the nvidia wheels.
+    """
+    roots = []
+    if is_frozen():
+        roots.append(resource_dir())
+    import site
+    try:
+        roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    found, seen = [], set()
+    for root in roots:
+        nv = Path(root) / "nvidia"
+        if not nv.is_dir():
+            continue
+        for bin_dir in sorted(nv.glob("*/bin")):
+            if bin_dir.is_dir() and str(bin_dir) not in seen:
+                seen.add(str(bin_dir))
+                found.append(str(bin_dir))
+    return found
+
+
 def enable_cuda_dlls():
-    """Make pip-installed CUDA libraries actually loadable on Windows.
+    """Make CUDA libraries actually loadable on Windows.
 
     ctranslate2 delay-loads cublas/cudnn DLLs *by name* from C++ at first
     inference. That lookup only checks modules already loaded into the
@@ -37,26 +74,8 @@ def enable_cuda_dlls():
     if sys.platform != "win32":
         return []
     import ctypes
-    import site
 
-    roots = []
-    try:
-        roots.extend(site.getsitepackages())
-    except Exception:
-        pass
-    try:
-        roots.append(site.getusersitepackages())
-    except Exception:
-        pass
-
-    found = []
-    for root in roots:
-        nv = Path(root) / "nvidia"
-        if not nv.is_dir():
-            continue
-        for bin_dir in nv.glob("*/bin"):
-            if bin_dir.is_dir():
-                found.append(str(bin_dir))
+    found = _nvidia_bin_dirs()
 
     for d in found:
         try:
