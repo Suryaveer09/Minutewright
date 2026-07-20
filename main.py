@@ -77,6 +77,10 @@ class SettingsBody(BaseModel):
     loopback_index: int | None = None
 
 
+class TitleBody(BaseModel):
+    title: str
+
+
 class AppState:
     """Holds the loaded model plus which recording (if any) is in progress."""
 
@@ -323,6 +327,24 @@ def record_stop():
     STATE.capture = None
     STATE.session_id = None
     STATE.session_folder = None
+    return meta
+
+
+@app.post("/api/recordings/{rec_id}/title")
+def set_title(rec_id: str, body: TitleBody):
+    """Rename a session. Display-only: meta.json's title changes, the
+    folder id stays the timestamp, so nothing on disk moves or breaks."""
+    folder = rec_folder(rec_id)
+    title = body.title.strip()[:120]
+    if not title:
+        raise HTTPException(400, "The name can't be empty.")
+    meta_file = folder / "meta.json"
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        raise HTTPException(404, "Recording metadata is missing.")
+    meta["title"] = title
+    meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
 

@@ -3,11 +3,11 @@
 <head>
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
-  - Audio settings (mic on/off, speaker + mic device pickers) load from
-    /api/settings + /api/devices and save on change; locked mid-recording.
-  - Transcript pane renders /api/recordings/{id}/lines: click any word
-    (word-timestamped sessions) or any line (older sessions) to seek the
-    audio player; the currently playing line highlights.
+  - Sessions are nameable: an inline rename editor in the detail view
+    (Enter saves, Escape cancels) opens automatically after stopping a
+    recording or finishing an upload, and stays available via Rename.
+  - Audio settings (mic on/off, device pickers) persist via /api/settings.
+  - Transcript pane: click any word/line to seek; playing line highlights.
   - Polls /api/status, /api/llm/status, /api/upload/status, /api/live.
 -->
 <meta charset="UTF-8">
@@ -152,7 +152,21 @@
 
   .detail{margin-top:18px; display:none}
   .detail.open{display:block}
-  .detail h3{font-family:var(--display); font-weight:700; font-size:19px; margin:0 0 2px}
+  .title-row{display:flex; align-items:center; gap:10px}
+  .detail h3{font-family:var(--display); font-weight:700; font-size:19px; margin:0}
+  .rename-link{
+    background:none; border:none; color:var(--ink-dim); cursor:pointer;
+    font-family:var(--body); font-size:12px; padding:2px 4px;
+  }
+  .rename-link:hover{color:var(--amber); text-decoration:underline}
+  .rename-form{display:none; gap:8px; margin:2px 0 4px}
+  .rename-form.show{display:flex}
+  .rename-input{
+    flex:1; background:var(--panel-2); border:1px solid var(--amber-dim);
+    border-radius:8px; color:var(--ink); font-family:var(--display);
+    font-weight:700; font-size:17px; padding:6px 10px;
+  }
+  .rename-input:focus-visible{outline:2px solid var(--amber); outline-offset:1px}
   .detail .sub{font-family:var(--mono); font-size:12px; color:var(--ink-dim); margin-bottom:12px}
   audio{width:100%; margin-bottom:6px}
   .no-audio{display:none; color:var(--ink-dim); font-size:13px; margin-bottom:6px}
@@ -281,7 +295,16 @@
     <div class="lib-list" id="libList"><div class="empty-lib">No recordings yet — record or upload one and it will appear here.</div></div>
 
     <div class="detail" id="detail">
-      <h3 id="dTitle"></h3>
+      <div class="title-row" id="titleRow">
+        <h3 id="dTitle"></h3>
+        <button class="rename-link" id="renBtn">Rename</button>
+      </div>
+      <div class="rename-form" id="renForm">
+        <input class="rename-input" id="renInput" maxlength="120"
+               placeholder="Name this recording…">
+        <button class="btn primary" id="renSave">Save</button>
+        <button class="btn" id="renCancel">Cancel</button>
+      </div>
       <div class="sub" id="dSub"></div>
       <audio controls preload="metadata" id="dAudio"></audio>
       <div class="no-audio" id="noAudio">No audio saved for this recording (made before audio saving existed).</div>
@@ -338,6 +361,7 @@ let whisperReady = false;
 let livePoll = null, timerTick = null;
 let recStartMs = null;
 let openId = null;
+let openTitle = '';
 let delArmed = null;
 let chatHistory = [];
 let chatBusy = false;
@@ -517,7 +541,9 @@ function renderUpload() {
     if (upState.error) { banner(upState.error); upState.error = null; }
     if (upState.done_id && upState.done_id !== upDoneSeen) {
       upDoneSeen = upState.done_id;
-      loadLibrary().then(() => openDetail(upDoneSeen));
+      loadLibrary()
+        .then(() => openDetail(upDoneSeen))
+        .then(() => startRename());   // let the user name the upload right away
     }
   }
 }
@@ -599,7 +625,8 @@ $('recBtn').addEventListener('click', async () => {
       const meta = await api('/api/record/stop', { method: 'POST' });
       exitRecording();
       await loadLibrary();
-      openDetail(meta.id, meta);
+      await openDetail(meta.id, meta);
+      startRename();               // let the user name the meeting right away
     }
   } catch (e) {
     banner(e.message);
@@ -630,6 +657,7 @@ async function loadLibrary() {
 async function openDetail(id, item) {
   openId = id;
   resetDelete();
+  cancelRename();
   chatHistory = [];
   renderChat();
   try {
@@ -637,8 +665,9 @@ async function openDetail(id, item) {
       const items = await api('/api/recordings');
       item = items.find(i => i.id === id) || { id };
     }
+    openTitle = item.title || id;
     $('detail').classList.add('open');
-    $('dTitle').textContent = item.title || id;
+    $('dTitle').textContent = openTitle;
     $('dSub').textContent =
       `${id.replace('_', ' ')} · ${fmt(item.duration_sec || 0)} · ${item.model || ''}`;
     $('noAudio').style.display = 'none';
@@ -659,6 +688,50 @@ $('dAudio').addEventListener('error', () => {
   if (!openId) return;
   $('dAudio').style.display = 'none';
   $('noAudio').style.display = 'block';
+});
+
+/* ---------- rename ---------- */
+function startRename() {
+  if (!openId) return;
+  $('titleRow').style.display = 'none';
+  $('renForm').classList.add('show');
+  const input = $('renInput');
+  input.value = openTitle;
+  input.focus();
+  input.select();
+}
+
+function cancelRename() {
+  $('renForm').classList.remove('show');
+  $('titleRow').style.display = '';
+}
+
+async function saveRename() {
+  const id = openId;
+  const title = $('renInput').value.trim();
+  if (!id) return;
+  if (!title || title === openTitle) { cancelRename(); return; }
+  try {
+    const meta = await api(`/api/recordings/${id}/title`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (openId === id) {
+      openTitle = meta.title;
+      $('dTitle').textContent = openTitle;
+    }
+    await loadLibrary();
+  } catch (e) { banner(e.message); }
+  cancelRename();
+}
+
+$('renBtn').addEventListener('click', startRename);
+$('renSave').addEventListener('click', saveRename);
+$('renCancel').addEventListener('click', cancelRename);
+$('renInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') saveRename();
+  if (e.key === 'Escape') cancelRename();
 });
 
 /* ---------- clickable transcript + playback highlight ---------- */
