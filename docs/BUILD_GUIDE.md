@@ -1,11 +1,12 @@
 # Minutewright — Build & Repository Guide
 
-> **Revision 4 (Jul 2026) — shipped.** v0.1.0 is released: two Windows
-> editions (Standard/CPU and NVIDIA-GPU) on the Releases page. This guide
-> is the project's engineering log, written as things actually happened —
-> including the debugging lessons — so a future contributor (or future
-> you) can understand not just *what* the code does but *why* it's shaped
-> this way.
+> **Revision 5 (Jul 2026) — v0.2.0 shipped.** Adds the post-release
+> Phase 11 (transcript export, native Save As, the app's own right-click
+> menu, app icon, and the clean-machine launch fix), with the pywebview
+> lessons that came out of it. This guide is the project's engineering
+> log, written as things actually happened — including the debugging
+> lessons — so a future contributor (or future you) can understand not
+> just *what* the code does but *why* it's shaped this way.
 
 Minutewright is a local meeting recorder for Windows. It records system audio
 and the microphone together, transcribes live, and offers AI summaries and
@@ -29,6 +30,9 @@ supports click-to-seek transcripts.
 - **summarize.py / chat.py** — prompts + calls over the shared LLM client.
 - **paths.py** — dev-vs-frozen path resolution; keeps user data out of the
   executable and in `%LOCALAPPDATA%\Minutewright` when packaged.
+- **exporters.py** — renders a session to nine export formats; text ones
+  are pure serialization, PDF/Word use reportlab and python-docx (both
+  pip-installable and PyInstaller-friendly, so users install nothing).
 - **static/index.html** — the entire UI, framework-free, one file.
 
 | Phase | Deliverable | Status |
@@ -49,6 +53,7 @@ supports click-to-seek transcripts.
 | 9e | Nameable recordings | Done |
 | 9f | Central path resolution (clean packaged data) | Done |
 | 10 | Package to `Minutewright.exe`, two editions, release | Done |
+| 11 | Post-release: exports, Save As, context menu, icon (v0.2.0) | Done |
 
 ## Documentation habits (applied every phase)
 
@@ -270,6 +275,7 @@ minutewright/
 ├── summarize.py         # minutes prompt over the shared LLM client
 ├── chat.py              # chat-with-transcript over the shared LLM client
 ├── paths.py             # dev-vs-frozen path resolution
+├── exporters.py         # transcript -> 9 export formats (pdf/docx incl.)
 ├── live_console.py      # engine demo without server or UI (debugging)
 ├── build_exe.py         # PyInstaller build logic (both editions)
 ├── build_exe.bat        # thin wrapper over build_exe.py
@@ -299,16 +305,104 @@ minutewright/
 
 ---
 
-## After v0.1.0 — working like a maintainer
+## Phase 11 — v0.2.0: exports, Save As, the menu saga  [DONE]
+
+The first post-release cycle. Also the cycle where the first real user
+(a friend's clean machine) found the first real launch bug.
+
+### Clean-machine launch fix
+A fresh download crashed with `Failed to resolve
+Python.Runtime.Loader.Initialize`. Two causes stacked: PyInstaller misses
+parts of the pythonnet/.NET bridge pywebview needs on Windows (fixed with
+`--collect-all pythonnet`, `--collect-all clr_loader`,
+`--copy-metadata pythonnet`, `--hidden-import clr`), and Windows'
+**Mark of the Web** blocks DLLs inside internet-downloaded zips
+(user-side recovery: PowerShell `Get-ChildItem -Recurse | Unblock-File`
+in the app folder; the real fix is a proper installer — roadmap).
+Lesson: the only true clean-machine test is a machine that isn't yours.
+
+### Transcript export (nine formats)
+`exporters.py` renders a session (`lines.json` + summary) to txt, md,
+html, srt, vtt, json, csv (pure Python serialization — SRT/VTT reuse the
+word timestamps already captured), plus **pdf** (reportlab) and **docx**
+(python-docx). Library choice was a packaging decision: both are
+pure-Python and PyInstaller-bundleable, so end users install nothing —
+Node-based or external-tool converters were ruled out for exactly that
+reason. The Export tab shows a live, mouse-selectable preview per format
+(binary formats show a note instead), with Copy all. Previews are cached
+per recording and invalidated when the summary or title changes, since
+exports embed both. Build additions: `--collect-all reportlab`,
+`--collect-all docx` (fonts/templates the scanner misses) — verified by
+exporting a PDF **from the built exe**, the only place font bundling can
+fail.
+
+### Native Save As — the js_api bridge
+"Save as…" opens the OS file dialog and writes the export wherever the
+user picks. This is the first use of pywebview's **js_api** bridge
+(Python methods callable as `window.pywebview.api.*`) — the privilege
+that makes this a desktop app rather than a website in a frame. The UI
+falls back to a normal browser download in `python main.py` dev mode.
+
+**Landmine documented in desktop.py:** js_api objects are *introspected* —
+pywebview walks their public attributes to build nested JS APIs. Storing
+the Window as a public attribute made it try to expose the entire native
+object graph to JS: infinite recursion on .NET's `Rectangle.Empty`,
+cross-thread COM errors on every WebView2 property, a full startup error
+storm. Native references on a js_api object must be underscore-private.
+
+### The right-click menu saga
+Goal: the standard Cut/Copy/Paste menu on text and inputs. Three failed
+attempts taught the real constraint, then the fix:
+
+1. JS `preventDefault` tuning — dead end: JS can only *suppress* context
+   menus, never create them.
+2. Flipping WebView2's `AreDefaultContextMenusEnabled` natively — also
+   dead: on Windows, **pywebview ties native context menus to debug
+   mode**, with no supported release-mode switch (its own docs say the
+   debug flag is what enables the menu).
+3. So the app **draws its own menu** — the approach VS Code and Discord
+   take. Cut/Copy/Select-all are pure JS; **Paste** reads the clipboard
+   from Python (JS clipboard *reads* are permission-gated in webviews)
+   via .NET's `Clipboard.GetText()` on a proper STA thread — chosen over
+   hand-rolled Win32 ctypes because battle-tested beats bespoke.
+4. One last self-inflicted bug: the menu dispatcher hid the menu (which
+   cleared its target-field state) *before* running the action, so
+   Paste/Cut/Select-all silently no-opped while Copy worked by accident
+   off the live selection. Fix: capture state first, then hide, then act.
+
+Meta-lesson, earned the hard way: **verify what the framework supports
+before engineering around it.** One documentation check would have
+skipped attempts 1 and 2 entirely.
+
+### App icon
+Amber "M" monogram on dark slate (the app's palette), generated as a
+multi-resolution `.ico` (16–256 px — Windows picks per context). Wired in
+two places: `webview.start(icon=...)` for the window/taskbar (resolved
+via `resource_dir()` so it works frozen) and PyInstaller `--icon` for the
+executable itself, with the `.ico` also bundled via `--add-data`.
+
+**Commits (selection):** `build: gpu edition bundles cuda dlls; cuda
+loader scans frozen bundle` · `feat: export transcript to
+txt/md/html/pdf/docx/srt/vtt/json/csv` · `feat: export tab preview pane` ·
+`feat: native save-as dialog via pywebview js_api bridge` · `feat: custom
+in-app context menu; win32->net clipboard bridge` · `fix: context menu
+actions received cleared state` · `feat: app icon (M monogram)` ·
+`docs: changelog for v0.2.0` · tag `v0.2.0`.
+
+---
+
+## After each release — working like a maintainer
 
 - **Branch per feature** from now on (`git switch -c feat/...`), PR to
   yourself, merge — keeps `main` always-working for anyone who clones.
-- **Issues as the roadmap**, seeded from the known limits: GPU-accelerated
-  summaries/chat (or an in-app "enable GPU" CUDA download, the slicker v0.2
-  option that was deferred at the finish line); word-level streaming captions;
-  speaker labels via diarization; chunked (map-reduce) summaries for long
-  meetings; cross-meeting search (the real RAG use case); dual-track
-  native-quality recording; code signing.
+- **Issues as the roadmap**, seeded from the known limits: a proper
+  **installer** (kills the Mark-of-the-Web/Unblock-File friction and the
+  SmartScreen double-warning — now the top item after a real user hit it);
+  GPU-accelerated summaries/chat (or an in-app "enable GPU" CUDA
+  download); word-level streaming captions; speaker labels via
+  diarization; chunked (map-reduce) summaries for long meetings;
+  cross-meeting search (the real RAG use case); dual-track native-quality
+  recording; code signing.
 - **CONTRIBUTING.md** the day a stranger opens their first issue, not before.
 
 ## Naming & license note (checked Jul 2026)
