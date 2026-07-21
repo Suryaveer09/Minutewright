@@ -5,8 +5,22 @@ native window (pywebview -> Edge WebView2 on Windows). No browser, no
 tabs - this is what gets packaged into Minutewright.exe.
 
 Also home to DesktopApi, the js_api bridge: Python methods the UI can
-call directly (window.pywebview.api.*). Used for the native Save As
-dialog - something a sandboxed web page can never offer.
+call directly (window.pywebview.api.*): the native Save As dialog, and
+a clipboard reader that powers Paste in the app's own right-click menu.
+
+Hard-won pywebview lessons encoded here:
+1. js_api objects are INTROSPECTED - pywebview walks public attributes to
+   build nested JS APIs. A public self.window on a js_api object makes it
+   try to expose the entire native object graph to JS (infinite recursion
+   on .NET's Rectangle.Empty, cross-thread COM errors). Native refs on a
+   js_api object must be underscore-private.
+2. On Windows, pywebview ties the native right-click menu to debug mode -
+   there is NO supported way to enable it in a release window, and JS can
+   only suppress menus, never create them. So the app draws its OWN
+   context menu in the UI (like VS Code/Discord do). Clipboard READ is
+   permission-gated inside the webview, so Paste is served from Python:
+   .NET's Clipboard.GetText() on a proper STA thread (WinForms requires
+   one), via pythonnet - which the app already ships for pywebview.
 """
 
 import os
@@ -37,16 +51,52 @@ from paths import resource_dir
 PORT = 8737
 
 
-class DesktopApi:
-    """Python methods exposed to the UI as window.pywebview.api.
+def _read_clipboard_text():
+    """Read text from the Windows clipboard.
 
-    save_export: render an export and write it wherever the user chooses
-    via the OS-native Save As dialog. The dialog call is safe from this
-    (js_api) thread - pywebview marshals it to the GUI thread internally.
+    Uses .NET's Clipboard via pythonnet (already shipped for pywebview)
+    instead of hand-rolled Win32 ctypes - GetText() handles clipboard
+    format-synthesis quirks. WinForms Clipboard requires an STA thread,
+    so the read runs on a real .NET STA thread.
     """
+    try:
+        import clr
+        clr.AddReference("System.Windows.Forms")
+        from System.Threading import ApartmentState, Thread, ThreadStart
+        from System.Windows.Forms import Clipboard
+
+        result = {"text": None}
+
+        def read():
+            try:
+                if Clipboard.ContainsText():
+                    result["text"] = Clipboard.GetText()
+            except Exception:
+                result["text"] = None
+
+        t = Thread(ThreadStart(read))
+        t.SetApartmentState(ApartmentState.STA)
+        t.Start()
+        t.Join(2000)   # milliseconds
+        return result["text"]
+    except Exception:
+        return None
+
+
+class DesktopApi:
+    """Python methods exposed to the UI as window.pywebview.api."""
 
     def __init__(self):
-        self.window = None  # set right after create_window
+        # PRIVATE on purpose - see module docstring, lesson 1.
+        self._window = None
+
+    def get_clipboard_text(self):
+        """Paste support for the app's own context menu."""
+        try:
+            text = _read_clipboard_text()
+        except Exception:
+            text = None
+        return {"ok": text is not None, "text": text or ""}
 
     def save_export(self, rec_id: str, fmt: str):
         try:
@@ -63,7 +113,7 @@ class DesktopApi:
         except Exception as exc:
             return {"ok": False, "error": f"Export failed: {exc}"}
 
-        result = self.window.create_file_dialog(
+        result = self._window.create_file_dialog(
             webview.SAVE_DIALOG,
             save_filename=_safe_filename(session["title"], ext),
             file_types=(f"{ext.upper()} file (*.{ext})", "All files (*.*)"),
@@ -121,19 +171,9 @@ if __name__ == "__main__":
         min_size=(800, 560),
         js_api=desktop_api,
     )
-    desktop_api.window = window
-
-    # Disable the WebView2 right-click developer menu (Reload / Inspect /
-    # Open in File Explorer) - a dev convenience that shouldn't ship.
-    def _harden():
-        try:
-            window.evaluate_js(
-                "document.addEventListener('contextmenu', e => e.preventDefault());"
-            )
-        except Exception:
-            pass
+    desktop_api._window = window
 
     _icon = resource_dir() / "minutewright.ico"
-    webview.start(_harden, icon=str(_icon) if _icon.exists() else None)
+    webview.start(icon=str(_icon) if _icon.exists() else None)
     # webview.start() blocks until the window closes; the daemon threads
     # (server + model) die with the process - closing the window exits the app.

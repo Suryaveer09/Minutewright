@@ -3,15 +3,16 @@
 <head>
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
-  - Export tab: format dropdown + live, mouse-selectable preview pane of
-    the rendered export (text formats), Copy all, and Save as… - which
-    calls Python over the pywebview js_api bridge to open the OS-native
-    Save dialog. In a plain browser (python main.py dev mode) the bridge
-    doesn't exist, so it falls back to a normal browser download.
-  - Sessions are nameable (inline editor, auto-opens after stop/upload).
-  - Audio settings (mic on/off, device pickers) persist via /api/settings.
-  - Transcript pane: click any word/line to seek; playing line highlights.
-  - Polls /api/status, /api/llm/status, /api/upload/status, /api/live.
+  - Custom right-click menu (Cut/Copy/Paste/Select all): pywebview has no
+    native context menu outside debug mode on Windows, so the app draws
+    its own, like VS Code does. Paste reads the clipboard through the
+    js_api bridge (window.pywebview.api.get_clipboard_text) because JS
+    clipboard reads are permission-gated in webviews; in plain-browser
+    dev mode it falls back to navigator.clipboard.readText().
+  - Export tab: format dropdown + selectable preview + Copy all +
+    Save as… (native dialog via js_api; browser fallback downloads).
+  - Sessions are nameable; audio settings persist; transcript click-to-
+    seek with playing-line highlight; polls status/llm/upload/live.
 -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -229,6 +230,24 @@
   }
   .export-pane:focus-visible{outline:2px solid var(--amber); outline-offset:1px}
 
+  /* custom context menu */
+  .ctx-menu{
+    position:fixed; z-index:60; display:none; min-width:170px;
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:4px; box-shadow:0 10px 28px rgba(0,0,0,.45);
+  }
+  .ctx-menu.show{display:block}
+  .ctx-item{
+    display:flex; justify-content:space-between; align-items:center; gap:20px;
+    width:100%; background:none; border:none; border-radius:6px;
+    color:var(--ink); font-family:var(--body); font-size:13px;
+    padding:7px 10px; cursor:pointer; text-align:left;
+  }
+  .ctx-item:hover{background:var(--panel-2)}
+  .ctx-item[disabled]{opacity:.4; cursor:default}
+  .ctx-item[disabled]:hover{background:none}
+  .ctx-kbd{color:var(--ink-dim); font-family:var(--mono); font-size:11px}
+
   .chat{display:none; margin-top:10px}
   .chat.open{display:block}
   .chat-log{
@@ -282,6 +301,7 @@
 
 <div class="banner" id="banner" role="alert"></div>
 <div class="toast" id="toast"></div>
+<div class="ctx-menu" id="ctxMenu" role="menu"></div>
 
 <main>
   <section class="card deck" id="deck">
@@ -464,6 +484,133 @@ function updateDeckButtons() {
   $('spkSel').disabled = lock;
   $('micSel').disabled = lock || !settings.capture_mic;
 }
+
+/* ---------- custom context menu ---------- */
+// pywebview has no native right-click menu outside debug mode on Windows,
+// so the app draws its own (the same approach VS Code and Discord take).
+// The dispatcher captures the target field BEFORE hiding the menu -
+// hideCtx() clears that state, and clearing it first is exactly the bug
+// that made Paste/Cut/Select-all silently do nothing in v1 of this menu.
+const inDesktop = () => !!(window.pywebview && window.pywebview.api);
+const ctxMenu = $('ctxMenu');
+let ctxField = null;      // the input/textarea the menu was opened on, if any
+let ctxContainer = null;  // nearest text container, for Select all
+
+function editableOf(el) {
+  return el && el.closest ? el.closest('input:not([type=file]), textarea') : null;
+}
+
+function fieldSelection(field) {
+  return field.value.substring(field.selectionStart || 0, field.selectionEnd || 0);
+}
+
+function hideCtx() {
+  ctxMenu.classList.remove('show');
+  ctxField = null;
+  ctxContainer = null;
+}
+
+function showCtx(x, y, items) {
+  ctxMenu.innerHTML = items.map(([label, kbd, enabled], i) =>
+    `<button class="ctx-item" data-i="${i}" ${enabled ? '' : 'disabled'}>
+       <span>${label}</span><span class="ctx-kbd">${kbd}</span>
+     </button>`).join('');
+  ctxMenu._actions = items.map(it => it[3]);
+  ctxMenu.classList.add('show');
+  // Clamp inside the viewport after it has a size.
+  const r = ctxMenu.getBoundingClientRect();
+  ctxMenu.style.left = Math.min(x, window.innerWidth - r.width - 8) + 'px';
+  ctxMenu.style.top = Math.min(y, window.innerHeight - r.height - 8) + 'px';
+}
+
+ctxMenu.addEventListener('click', e => {
+  const btn = e.target.closest('.ctx-item');
+  if (!btn || btn.disabled) return;
+  const action = ctxMenu._actions[parseInt(btn.dataset.i)];
+  // Capture state BEFORE hideCtx clears it, then pass it to the action.
+  const field = ctxField;
+  const container = ctxContainer;
+  hideCtx();
+  if (action) action(field, container);
+});
+
+function ctxCopy(field) {
+  const text = field ? fieldSelection(field)
+                     : (window.getSelection ? window.getSelection().toString() : '');
+  if (text) { copyText(text); toast('Copied'); }
+}
+
+function ctxCut(field) {
+  if (!field) return;
+  const text = fieldSelection(field);
+  if (!text) return;
+  copyText(text);
+  field.setRangeText('', field.selectionStart, field.selectionEnd, 'end');
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  field.focus();
+}
+
+async function ctxPaste(field) {
+  if (!field) return;
+  let text = null;
+  try {
+    if (inDesktop()) {
+      const res = await window.pywebview.api.get_clipboard_text();
+      if (res.ok) text = res.text;
+    } else if (navigator.clipboard && navigator.clipboard.readText) {
+      text = await navigator.clipboard.readText();
+    }
+  } catch (e) { /* fall through to hint */ }
+  if (text === null) { toast('Press Ctrl+V to paste'); return; }
+  field.focus();
+  field.setRangeText(text, field.selectionStart, field.selectionEnd, 'end');
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function ctxSelectAll(field, container) {
+  if (field) {
+    field.focus();
+    field.select();
+    return;
+  }
+  const target = container || document.body;
+  const range = document.createRange();
+  range.selectNodeContents(target);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+document.addEventListener('contextmenu', e => {
+  e.preventDefault();   // there is no useful native menu to allow through
+  const field = editableOf(e.target);
+  const hasSel = !!(window.getSelection && window.getSelection().toString());
+  if (!field && !hasSel) { hideCtx(); return; }   // blank areas: no menu
+
+  ctxField = field;
+  ctxContainer = field ? null :
+    (e.target.closest ? e.target.closest('.export-pane, .pane, .chat-log, .feed') : null);
+
+  const items = [];
+  if (field) {
+    const fieldSel = !!fieldSelection(field);
+    items.push(['Cut', 'Ctrl+X', fieldSel, ctxCut]);
+    items.push(['Copy', 'Ctrl+C', fieldSel, ctxCopy]);
+    items.push(['Paste', 'Ctrl+V', true, ctxPaste]);
+    items.push(['Select all', 'Ctrl+A', !!field.value, ctxSelectAll]);
+  } else {
+    items.push(['Copy', 'Ctrl+C', true, ctxCopy]);
+    items.push(['Select all', 'Ctrl+A', true, ctxSelectAll]);
+  }
+  showCtx(e.clientX, e.clientY, items);
+});
+
+document.addEventListener('mousedown', e => {
+  if (!ctxMenu.contains(e.target)) hideCtx();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideCtx(); });
+window.addEventListener('resize', hideCtx);
+document.addEventListener('scroll', hideCtx, true);
 
 /* ---------- audio settings ---------- */
 async function loadAudioSettings() {
@@ -857,7 +1004,6 @@ $('dAudio').addEventListener('timeupdate', () => {
 
 /* ---------- export ---------- */
 function fmtMeta(key) { return FORMATS.find(f => f[0] === key); }
-const inDesktop = () => !!(window.pywebview && window.pywebview.api);
 
 function initExportControls() {
   $('fmtSel').innerHTML = FORMATS.map(([k, label]) =>
@@ -924,6 +1070,7 @@ $('expSave').addEventListener('click', async () => {
   const key = $('fmtSel').value;
   const btn = $('expSave');
   btn.disabled = true;
+  const original = btn.textContent;
   try {
     if (inDesktop()) {
       // Native path: Python opens the OS Save dialog and writes the file.
@@ -936,6 +1083,7 @@ $('expSave').addEventListener('click', async () => {
       await downloadFile(`/api/recordings/${openId}/export/${key}`);
     }
   } catch (e) { banner(e.message); }
+  btn.textContent = original;
   btn.disabled = false;
 });
 
