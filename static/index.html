@@ -3,10 +3,11 @@
 <head>
 <!--
   Minutewright UI. Deliberately framework-free: one file, plain JS.
-  - Export tab: nine formats. Text ones (txt/md/srt/vtt/json/csv/html) get
-    Copy + Download; binary ones (docx/pdf) get Download. Downloads use the
-    fetch->blob->object-URL pattern because a plain <a download> can make a
-    webview navigate to the file instead of saving it.
+  - Export tab: format dropdown + live, mouse-selectable preview pane of
+    the rendered export (text formats), Copy all, and Save as… - which
+    calls Python over the pywebview js_api bridge to open the OS-native
+    Save dialog. In a plain browser (python main.py dev mode) the bridge
+    doesn't exist, so it falls back to a normal browser download.
   - Sessions are nameable (inline editor, auto-opens after stop/upload).
   - Audio settings (mic on/off, device pickers) persist via /api/settings.
   - Transcript pane: click any word/line to seek; playing line highlights.
@@ -211,22 +212,22 @@
   /* export tab */
   .export{display:none; margin-top:10px}
   .export.open{display:block}
-  .export .intro{color:var(--ink-dim); font-size:13px; margin:0 0 12px}
-  .fmt-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:10px}
-  .fmt{
-    border:1px solid var(--line); background:var(--panel-2); border-radius:8px;
-    padding:12px 14px;
+  .export-bar{display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap}
+  .fmt-sel{
+    background:var(--panel-2); border:1px solid var(--line); color:var(--ink);
+    border-radius:8px; padding:8px 10px; font-family:var(--body); font-size:14px;
+    min-width:190px;
   }
-  .fmt .name{font-family:var(--display); font-weight:700; font-size:15px}
-  .fmt .desc{color:var(--ink-dim); font-size:12px; margin:2px 0 10px}
-  .fmt .btns{display:flex; gap:8px}
-  .fmt button{
-    border:1px solid var(--line); background:var(--panel); color:var(--ink);
-    border-radius:7px; padding:6px 12px; font-family:var(--body); font-size:13px; cursor:pointer;
+  .fmt-sel:focus-visible{outline:2px solid var(--amber); outline-offset:1px}
+  .export-note{color:var(--ink-dim); font-size:12px; margin:0 0 8px}
+  .export-pane{
+    white-space:pre-wrap; word-break:break-word; background:var(--panel-2);
+    border:1px solid var(--line); border-radius:8px; padding:14px;
+    max-height:46vh; overflow-y:auto; margin:0;
+    font-family:var(--mono); font-size:12.5px; line-height:1.6;
+    user-select:text; cursor:text;
   }
-  .fmt button:hover{border-color:var(--amber-dim)}
-  .fmt button.primary{border-color:var(--amber); color:var(--amber)}
-  .fmt button:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+  .export-pane:focus-visible{outline:2px solid var(--amber); outline-offset:1px}
 
   .chat{display:none; margin-top:10px}
   .chat.open{display:block}
@@ -365,10 +366,13 @@
       </div>
 
       <div class="export" id="paneE">
-        <p class="intro">Export this transcript. Text formats can be copied or
-          downloaded; Word and PDF are downloads. Summaries are included when
-          present.</p>
-        <div class="fmt-grid" id="fmtGrid"></div>
+        <div class="export-bar">
+          <select class="fmt-sel" id="fmtSel"></select>
+          <button class="btn" id="expCopy">Copy all</button>
+          <button class="btn primary" id="expSave">Save as…</button>
+        </div>
+        <p class="export-note" id="expNote"></p>
+        <pre class="export-pane" id="expPane" tabindex="0"></pre>
       </div>
 
       <div class="actions">
@@ -410,11 +414,12 @@ let activeTab = 'T';
 let lineEls = [];
 let playingIdx = -1;
 let settings = { capture_mic: true, mic_index: null, loopback_index: null };
+let exportCache = {};   // fmt -> rendered text, cleared per recording
 
 // Export formats: [key, label, description, isText]
 const FORMATS = [
-  ["txt",  "Text",     "Plain .txt with timestamps",     true],
-  ["md",   "Markdown", "Headings + summary, .md",         true],
+  ["txt",  "Text",     "Plain text with timestamps",      true],
+  ["md",   "Markdown", "Headings + summary",              true],
   ["html", "HTML",     "Styled standalone web page",      true],
   ["pdf",  "PDF",      "Formatted document",              false],
   ["docx", "Word",     "Editable .docx document",         false],
@@ -718,6 +723,7 @@ async function openDetail(id, item) {
   resetDelete();
   cancelRename();
   chatHistory = [];
+  exportCache = {};        // exports are per-recording
   renderChat();
   try {
     if (!item) {
@@ -738,7 +744,6 @@ async function openDetail(id, item) {
 
     const s = await api(`/api/recordings/${id}/summary`);
     setSummary(s.summary);
-    renderExport();
     showTab('T');
     await loadLibrary();
   } catch (e) { banner(e.message); }
@@ -780,6 +785,7 @@ async function saveRename() {
     if (openId === id) {
       openTitle = meta.title;
       $('dTitle').textContent = openTitle;
+      exportCache = {};    // exports embed the title
     }
     await loadLibrary();
   } catch (e) { banner(e.message); }
@@ -850,47 +856,87 @@ $('dAudio').addEventListener('timeupdate', () => {
 });
 
 /* ---------- export ---------- */
-function renderExport() {
-  const grid = $('fmtGrid');
-  grid.innerHTML = '';
-  FORMATS.forEach(([key, label, desc, isText]) => {
-    const card = document.createElement('div');
-    card.className = 'fmt';
-    card.innerHTML = `<div class="name">${label}</div>
-      <div class="desc">${esc(desc)}</div>
-      <div class="btns">
-        ${isText ? `<button data-copy="${key}">Copy</button>` : ''}
-        <button class="primary" data-dl="${key}">Download</button>
-      </div>`;
-    grid.appendChild(card);
-  });
+function fmtMeta(key) { return FORMATS.find(f => f[0] === key); }
+const inDesktop = () => !!(window.pywebview && window.pywebview.api);
+
+function initExportControls() {
+  $('fmtSel').innerHTML = FORMATS.map(([k, label]) =>
+    `<option value="${k}">${label} (.${k})</option>`).join('');
 }
 
-$('fmtGrid').addEventListener('click', async e => {
-  const copyKey = e.target.getAttribute('data-copy');
-  const dlKey = e.target.getAttribute('data-dl');
+async function renderExport() {
   if (!openId) return;
+  const id = openId;
+  const key = $('fmtSel').value || 'txt';
+  const meta = fmtMeta(key);
+  const isText = meta ? meta[3] : false;
+  const pane = $('expPane');
 
-  if (copyKey) {
-    e.target.disabled = true;
-    try {
-      const res = await api(`/api/recordings/${openId}/export/${copyKey}/text`);
-      await copyText(res.text);
-      toast(`${copyKey.toUpperCase()} copied to clipboard`);
-    } catch (err) { banner(err.message); }
-    e.target.disabled = false;
+  $('expCopy').style.display = isText ? '' : 'none';
+
+  if (!isText) {
+    $('expNote').textContent = `${meta[1]} is a binary document, so there's no text to preview — use Save as… to choose where the file goes.`;
+    pane.style.display = 'none';
+    return;
   }
 
-  if (dlKey) {
-    e.target.disabled = true;
-    const original = e.target.textContent;
-    e.target.textContent = 'Preparing…';
-    try {
-      await downloadFile(`/api/recordings/${openId}/export/${dlKey}`);
-    } catch (err) { banner(err.message); }
-    e.target.textContent = original;
-    e.target.disabled = false;
+  $('expNote').textContent = 'Select any text below with your mouse, or use Copy all / Save as…';
+  pane.style.display = '';
+
+  if (exportCache[key] !== undefined) {
+    pane.textContent = exportCache[key];
+    return;
   }
+  pane.textContent = 'Rendering…';
+  try {
+    const res = await api(`/api/recordings/${id}/export/${key}/text`);
+    exportCache[key] = res.text;
+    // Only paint if the user hasn't switched recording/format meanwhile.
+    if (openId === id && $('fmtSel').value === key) pane.textContent = res.text;
+  } catch (e) {
+    if (openId === id && $('fmtSel').value === key) pane.textContent = '';
+    banner(e.message);
+  }
+}
+
+$('fmtSel').addEventListener('change', renderExport);
+
+$('expCopy').addEventListener('click', async () => {
+  if (!openId) return;
+  const key = $('fmtSel').value;
+  const btn = $('expCopy');
+  btn.disabled = true;
+  try {
+    let text = exportCache[key];
+    if (text === undefined) {
+      const res = await api(`/api/recordings/${openId}/export/${key}/text`);
+      text = res.text;
+      exportCache[key] = text;
+    }
+    await copyText(text);
+    toast(`${fmtMeta(key)[1]} copied to clipboard`);
+  } catch (e) { banner(e.message); }
+  btn.disabled = false;
+});
+
+$('expSave').addEventListener('click', async () => {
+  if (!openId) return;
+  const key = $('fmtSel').value;
+  const btn = $('expSave');
+  btn.disabled = true;
+  try {
+    if (inDesktop()) {
+      // Native path: Python opens the OS Save dialog and writes the file.
+      const res = await window.pywebview.api.save_export(openId, key);
+      if (res.ok) toast('Saved ' + res.path.split(/[\\/]/).pop());
+      else if (!res.cancelled) banner(res.error || 'Save failed.');
+    } else {
+      // Plain-browser dev mode (python main.py): no native dialogs exist,
+      // fall back to a normal browser download.
+      await downloadFile(`/api/recordings/${openId}/export/${key}`);
+    }
+  } catch (e) { banner(e.message); }
+  btn.disabled = false;
 });
 
 async function copyText(text) {
@@ -910,8 +956,7 @@ async function copyText(text) {
 }
 
 async function downloadFile(url) {
-  // fetch -> blob -> object URL, because a plain <a download> can make a
-  // webview navigate to the file instead of saving it.
+  // fetch -> blob -> object URL: the browser-only fallback path.
   const res = await fetch(url);
   if (!res.ok) {
     let msg = res.statusText;
@@ -951,6 +996,7 @@ function showTab(which) {
   }
   renderLlmGate();
   if (which === 'C' && llmReady()) $('chatInput').focus();
+  if (which === 'E') renderExport();
 }
 $('tabT').addEventListener('click', () => showTab('T'));
 $('tabS').addEventListener('click', () => showTab('S'));
@@ -970,6 +1016,7 @@ $('sumBtn').addEventListener('click', async () => {
   try {
     const res = await api(`/api/recordings/${openId}/summarize`, { method: 'POST' });
     setSummary(res.summary);
+    exportCache = {};   // exports embed the summary, so cached previews are stale
     await loadLibrary();
   } catch (e) {
     banner(e.message);
@@ -1047,11 +1094,13 @@ $('delBtn').addEventListener('click', async () => {
     $('detail').classList.remove('open');
     openId = null;
     chatHistory = [];
+    exportCache = {};
     await loadLibrary();
   } catch (e) { banner(e.message); }
 });
 
 /* ---------- boot ---------- */
+initExportControls();
 refreshStatus();
 setInterval(refreshStatus, 2500);
 pollLlm();
