@@ -23,27 +23,47 @@ mode with an interactive tester at `/docs`.
 | GET    | /api/recordings/{id}/audio | The recording's audio, served with the correct media type for its stored format. 404 if none. |
 | GET    | /api/recordings/{id}/transcript | Plain timestamped transcript text. |
 | GET    | /api/recordings/{id}/lines | Structured transcript for click-to-seek: `{"lines": [{"t", "text", "words": [{"w", "s"}]}]}`. Sessions from before word timestamps existed fall back to line-level entries parsed from `transcript.txt`. |
+| GET    | /api/recordings/{id}/export/{fmt} | Render the transcript (plus summary, when present) in a given format and return it as a file download with a Content-Disposition filename derived from the session title. Formats: `txt`, `md`, `html`, `pdf`, `docx`, `srt`, `vtt`, `json`, `csv`. 400 for unknown formats or empty transcripts. |
+| GET    | /api/recordings/{id}/export/{fmt}/text | The rendered export as raw text, `{"text": "..."}` — powers the Export tab's preview and copy-to-clipboard. Text formats only (`txt`, `md`, `html`, `srt`, `vtt`, `json`, `csv`); 400 for binary formats (`pdf`, `docx`). |
 | GET    | /api/recordings/{id}/summary | `{"summary": "..."}` or `{"summary": null}`. |
 | POST   | /api/recordings/{id}/summarize | Generate minutes with the bundled LLM and save `summary.md`. 400 if no transcript; 503 if the model isn't downloaded or generation fails. CPU inference: expect a minute or two. |
-| POST   | /api/recordings/{id}/chat | Ask about a transcript. Body `{"message", "history": [{"role", "content"}]}`. Returns `{"reply"}`. Stateless — the client sends history each turn. 400 if no transcript/empty message; 503 if the model isn't downloaded. |
+| POST   | /api/recordings/{id}/chat | Ask a question about a transcript. Body `{"message", "history": [{"role", "content"}]}`. Returns `{"reply"}`. Stateless — the client sends the running history each turn. 400 if no transcript/empty message; 503 if the model isn't downloaded. |
 | DELETE | /api/recordings/{id} | Remove a session folder entirely. 409 if it's currently recording or being transcribed. |
+
+## Beyond HTTP: the desktop bridge
+
+The HTTP API above is not the app's entire Python↔UI surface. In the
+desktop window, pywebview's **js_api bridge** exposes a few Python methods
+directly to the page as `window.pywebview.api.*` — used where a sandboxed
+web page can't act:
+
+- `save_export(rec_id, fmt)` — renders an export and opens the OS-native
+  Save As dialog, writing the file wherever the user chooses. Returns
+  `{"ok", "path"}`, `{"ok": false, "cancelled": true}`, or an error.
+- `get_clipboard_text()` — reads the Windows clipboard (via .NET on an
+  STA thread) to power Paste in the app's own right-click menu, since
+  clipboard *reads* are permission-gated inside webviews.
+
+In plain-browser dev mode (`python main.py`) the bridge doesn't exist;
+the UI falls back to browser downloads and `navigator.clipboard`.
 
 ## Notes
 
 - **Paths.** Bundled read-only assets (`static/`) resolve via
-  `paths.resource_dir()`; user-writable data (`recordings/`, `settings.json`,
-  the LLM `models/`) via `paths.data_dir()`. In dev both are the project
-  folder; in a packaged build, data moves to `%LOCALAPPDATA%\Minutewright`
-  so the executable stays clean and user data survives app updates.
-- **Recording ids** are timestamps (`2026-07-19_16-20-12`), validated against
-  `^[0-9_\-]+$` before any filesystem access.
-- **Session folder** contents: `audio.<ext>`, `transcript.txt`, `lines.json`,
-  `meta.json`, and `summary.md` once generated.
+  `paths.resource_dir()`; user-writable data (`recordings/`,
+  `settings.json`, the LLM `models/`) via `paths.data_dir()`. In dev both
+  are the project folder; in a packaged build, data moves to
+  `%LOCALAPPDATA%\Minutewright` so the executable stays clean and user
+  data survives app updates.
+- **Recording ids** are timestamps (`2026-07-19_16-20-12`), validated
+  against `^[0-9_\-]+$` before any filesystem access.
+- **Session folder** contents: `audio.<ext>`, `transcript.txt`,
+  `lines.json`, `meta.json`, and `summary.md` once generated.
 - **The LLM is bundled in-process** (llama-cpp-python, CPU) — no external
-  services. Only one LLM request runs at a time; the UI serializes summary
-  and chat calls accordingly.
-- **One transcription job at a time.** Live recording and file uploads share
-  the single Whisper instance and are mutually exclusive by design; the
-  server enforces this and the UI reflects it.
-- **Conversation state** lives in the UI per opened recording; the server is
-  stateless about chat history.
+  services. Only one LLM request runs at a time; the UI serializes
+  summary and chat calls accordingly.
+- **One transcription job at a time.** Live recording and file uploads
+  share the single Whisper instance and are mutually exclusive by design;
+  the server enforces this and the UI reflects it.
+- **Conversation state** lives in the UI per opened recording; the server
+  is stateless about chat history.
