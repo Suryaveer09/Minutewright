@@ -26,3 +26,5 @@ Thumbs.db
 Misc/
 .pytest_cache/
 settings.json
+*.paint
+*.png

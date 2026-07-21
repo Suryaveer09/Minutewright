@@ -2,11 +2,11 @@
 
 Wraps capture.LiveCapture behind an HTTP API so the desktop window (or
 anything else) can start/stop recordings, upload existing recordings,
-poll live captions, generate summaries, and chat with transcripts.
-The Whisper model loads in a background thread at startup; the LLM for
-summaries/chat is bundled in-process (llm.py) and its weights are
-downloaded in-app on first use. Audio-device choices persist in
-settings.json.
+poll live captions, generate summaries, chat with transcripts, and export
+transcripts to various formats. The Whisper model loads in a background
+thread at startup; the LLM for summaries/chat is bundled in-process
+(llm.py) and its weights are downloaded in-app on first use. Audio-device
+choices persist in settings.json.
 
 Paths: bundled assets (static/) resolve via paths.resource_dir(); user
 data (recordings/, settings.json) via paths.data_dir(), which moves to
@@ -25,11 +25,12 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
 import chat as chatmod
+import exporters
 import llm
 import summarize as summarizer
 from capture import LiveCapture, list_devices, transcribe_file
@@ -185,6 +186,42 @@ def rec_folder(rec_id: str) -> Path:
     if not folder.is_dir():
         raise HTTPException(404, "Recording not found")
     return folder
+
+
+def load_session(rec_id: str) -> dict:
+    """Assemble the dict the exporters expect: {id, title, lines, summary}."""
+    folder = rec_folder(rec_id)
+
+    title = rec_id
+    meta_file = folder / "meta.json"
+    if meta_file.exists():
+        try:
+            title = json.loads(meta_file.read_text(encoding="utf-8")).get("title", rec_id)
+        except json.JSONDecodeError:
+            pass
+
+    lines_file = folder / "lines.json"
+    if lines_file.exists():
+        lines = json.loads(lines_file.read_text(encoding="utf-8"))
+    else:
+        # Fall back to parsing transcript.txt for pre-word-timestamp sessions.
+        lines = []
+        tf = folder / "transcript.txt"
+        if tf.exists():
+            for raw in tf.read_text(encoding="utf-8").splitlines():
+                m = TS_LINE_RE.match(raw)
+                if m:
+                    t = int(m.group(1)) * 60 + int(m.group(2))
+                    lines.append({"t": t, "text": m.group(3), "words": []})
+                elif raw.strip():
+                    lines.append({"t": 0, "text": raw.strip(), "words": []})
+
+    summary = None
+    sf = folder / "summary.md"
+    if sf.exists():
+        summary = sf.read_text(encoding="utf-8")
+
+    return {"id": rec_id, "title": title, "lines": lines, "summary": summary}
 
 
 def write_session_files(folder: Path, rec_id: str, title: str, lines: list,
@@ -353,6 +390,43 @@ def set_title(rec_id: str, body: TitleBody):
     meta["title"] = title
     meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
+
+
+# ------------------------------------------------------------ export
+def _safe_filename(title: str, ext: str) -> str:
+    base = re.sub(r"[^0-9A-Za-z _.-]", "", title).strip() or "transcript"
+    return f"{base[:80]}.{ext}"
+
+
+@app.get("/api/recordings/{rec_id}/export/{fmt}")
+def export_download(rec_id: str, fmt: str):
+    session = load_session(rec_id)
+    if not session["lines"]:
+        raise HTTPException(400, "This recording has no transcript to export.")
+    try:
+        data, media_type, ext = exporters.export(session, fmt)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Export failed: {exc}")
+    filename = _safe_filename(session["title"], ext)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/recordings/{rec_id}/export/{fmt}/text")
+def export_text(rec_id: str, fmt: str):
+    """Raw text of a text-format export, for copy-to-clipboard."""
+    if fmt not in exporters.TEXT_FORMATS:
+        raise HTTPException(400, "This format isn't available as copyable text.")
+    session = load_session(rec_id)
+    if not session["lines"]:
+        raise HTTPException(400, "This recording has no transcript to export.")
+    data, _media, _ext = exporters.export(session, fmt)
+    return {"text": data.decode("utf-8")}
 
 
 # ------------------------------------------------------------ uploads

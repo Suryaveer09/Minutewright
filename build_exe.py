@@ -33,11 +33,23 @@ cmd = [
     "desktop.py",
     "--noconfirm", "--clean", "--onedir",
     "--name", NAME,
+    "--icon", "minutewright.ico",
     "--add-data", "static;static",
+    "--add-data", "minutewright.ico;.",
     "--collect-all", "llama_cpp",       # llama.cpp native DLLs
     "--collect-all", "faster_whisper",  # bundled Silero VAD assets
     "--collect-all", "ctranslate2",     # whisper engine's native libraries
-    "--collect-all", "webview",         # WebView2 loader DLLs
+    "--collect-all", "webview",         # pywebview
+    # pythonnet / .NET bridge that pywebview uses for WebView2 on Windows.
+    # PyInstaller's scanner misses its runtime DLLs, so collect everything
+    # explicitly - without this the app crashes on clean machines with
+    # "Failed to resolve Python.Runtime.Loader.Initialize".
+    "--collect-all", "pythonnet",
+    "--collect-all", "clr_loader",
+    "--collect-all", "reportlab",       # PDF export fonts/data
+    "--collect-all", "docx",            # python-docx templates
+    "--copy-metadata", "pythonnet",
+    "--hidden-import", "clr",
 ]
 if not DEBUG:
     cmd.append("--windowed")

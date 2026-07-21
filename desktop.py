@@ -68,6 +68,11 @@ if __name__ == "__main__":
         min_size=(800, 560),
     )
 
+    # App icon for the title bar / taskbar. Resolve via resource_dir so it
+    # works both in dev and inside the packaged exe.
+    from paths import resource_dir
+    _icon = resource_dir() / "minutewright.ico"
+
     # Disable the WebView2 right-click developer menu (Reload / Inspect /
     # Open in File Explorer) - a dev convenience that shouldn't ship.
     def _harden():
@@ -78,6 +83,6 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    webview.start(_harden)
+    webview.start(_harden, icon=str(_icon) if _icon.exists() else None)
     # webview.start() blocks until the window closes; the daemon threads
     # (server + model) die with the process - closing the window exits the app.
